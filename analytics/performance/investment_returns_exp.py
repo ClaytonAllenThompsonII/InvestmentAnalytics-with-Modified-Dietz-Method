@@ -236,6 +236,7 @@ def plot_combined_chart_with_tooltips(equities_nav, stock_symbol):
     )
 
     fig.show()
+
 def main(file_path, stock_symbol):
     df_stock = load_and_prepare_data(file_path, stock_symbol)
     df_equities = calculate_cumulative_shares(df_stock[df_stock['Event_Type'].isin(['Buy', 'Sell', 'Split'])])
