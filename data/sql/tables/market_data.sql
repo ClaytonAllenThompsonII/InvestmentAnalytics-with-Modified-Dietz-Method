@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS market_data (
     high_price    NUMERIC,
     low_price     NUMERIC,
     close_price   NUMERIC,
-    adj_close     NUMERIC,
+    --adj_close     NUMERIC, removed
     volume        BIGINT,
 
     currency      VARCHAR(10),

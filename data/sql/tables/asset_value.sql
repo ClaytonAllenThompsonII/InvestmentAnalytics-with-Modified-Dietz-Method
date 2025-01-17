@@ -2,7 +2,7 @@ DROP TABLE IF EXISTS asset_value;
 
 CREATE TABLE asset_value (
     asset_value_id SERIAL PRIMARY KEY,
-    as_of_date DATE NOT NULL,
+    as_of_date DATE NOT NULL, -- monthly periods, always last day of month
     instrument VARCHAR(50) NOT NULL,
     shares_bom NUMERIC, -- Shares at the beginning of the month
     shares_eom NUMERIC, -- Shares at the end of the month
