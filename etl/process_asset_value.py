@@ -1,9 +1,9 @@
+import os
 import psycopg2
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from calendar import monthrange
 from dotenv import load_dotenv
-import os
 
 # Load environment variables
 load_dotenv()
@@ -24,10 +24,14 @@ def get_connection():
         password=DB_PASSWORD
     )
 
+# 1) Fetch Transactions
 def fetch_transactions():
-    """Fetch relevant transactions for equity-related events."""
+    """
+    Retrieve relevant transactions (Buy, Sell, Dividend, Split).
+    We only gather columns needed for monthly P&L and share changes.
+    """
     query = """
-        SELECT 
+        SELECT
             activity_date,
             instrument,
             raw_trans_code AS event_type,
@@ -35,185 +39,233 @@ def fetch_transactions():
             amount
         FROM transactions
         WHERE raw_trans_code IN ('Buy', 'Sell', 'CDIV', 'SPL')
-        ORDER BY activity_date;
+        ORDER BY activity_date
     """
-    conn = get_connection()
-    df = pd.read_sql(query, conn)
-    conn.close()
-    df['activity_date'] = pd.to_datetime(df['activity_date']).dt.tz_localize(None)  # Remove timezone
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn)
+
+    # Ensure datetime is timezone-naive
+    df['activity_date'] = pd.to_datetime(df['activity_date']).dt.tz_localize(None)
+
+    # Create a year-month Period from the activity_date
+    df['txn_month'] = df['activity_date'].dt.to_period('M')
+
     return df
 
-def fetch_market_data():
-    """Fetch market data for selected instruments and fill missing prices."""
+# 2) Fetch Monthly Market Data
+def fetch_monthly_market_data():
+    """
+    We assume each row in market_data is already monthly,
+    e.g., recorded on the 15th or some consistent day each month.
+    We'll simply convert price_date => year_month, 
+    and treat close_price as 'this month's price'.
+    """
     query = """
-    WITH monthly_data AS (
-        SELECT 
+        SELECT
             instrument,
-            DATE_TRUNC('month', price_date) AS month_start,
-            MAX(price_date) AS eom_date
+            price_date,
+            close_price
         FROM market_data
-        WHERE instrument IN ('AAPL', 'CPNG', 'TSM', 'TOST', 'NU', 'NVO', 'MSFT', 'INTC', 'AMRC')
-        GROUP BY instrument, DATE_TRUNC('month', price_date)
-    ),
-    eom_prices AS (
-        SELECT 
-            md.instrument,
-            md.month_start,
-            md.eom_date,
-            md2.close_price AS eom_price
-        FROM monthly_data md
-        JOIN market_data md2
-        ON md.instrument = md2.instrument AND md.eom_date = md2.price_date
-    )
-    SELECT 
-        e1.instrument,
-        e1.month_start,
-        e1.eom_price AS bom_price,  -- Use previous EOM as BOM for the current month
-        e2.eom_price AS eom_price
-    FROM eom_prices e1
-    LEFT JOIN eom_prices e2
-    ON e1.instrument = e2.instrument AND e1.month_start = e2.month_start - INTERVAL '1 month'
-    ORDER BY e1.instrument, e1.month_start;
+        ORDER BY instrument, price_date
     """
-    conn = get_connection()
-    df = pd.read_sql(query, conn)
-    conn.close()
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn)
 
-    # Print column types for debugging
-    print("Column types before processing:", df.dtypes)
+    df['price_date'] = pd.to_datetime(df['price_date']).dt.tz_localize(None)
+    # Convert to Period
+    df['year_month'] = df['price_date'].dt.to_period('M')
 
-    # Ensure `month_start` is datetime and timezone-naive
-    if 'month_start' in df.columns:
-        df['month_start'] = pd.to_datetime(df['month_start'], errors='coerce')
-        if df['month_start'].dt.tz is not None:  # If timezone-aware
-            df['month_start'] = df['month_start'].dt.tz_convert('UTC').dt.tz_localize(None)
+    # Potentially rename 'close_price' to 'monthly_price' for clarity
+    df.rename(columns={'close_price': 'monthly_price'}, inplace=True)
 
-    # Sort by instrument and month_start to ensure forward and backward fill work correctly
-    df = df.sort_values(by=['instrument', 'month_start'])
+    # We'll keep columns: [instrument, year_month, monthly_price]
+    # Possibly discard 'price_date' if unneeded:
+    return df[['instrument','year_month','monthly_price']]
 
-    # Fill missing BOM and EOM prices with the last available values
-    df['bom_price'] = df.groupby('instrument')['bom_price'].ffill()
-    df['eom_price'] = df.groupby('instrument')['eom_price'].ffill()
+# 3) Summarize Transactions by Month/Instrument
+def summarize_transactions(transactions):
+    """
+    For each (instrument, txn_month):
+      - sum 'amount' => net_cf
+      - sum 'quantity' => net_shares_change
+      - sum dividends if event_type=='CDIV' => realized_pnl
+      - Weighted CF is optional. We'll do a simple half-month approach or skip.
+    """
+    trans_agg = []
+    for (instr, ymonth), grp in transactions.groupby(['instrument','txn_month']):
+        net_cf = grp['amount'].sum()
+        net_shares_change = grp['quantity'].sum()
+        realized_pnl = grp.loc[grp['event_type'] == 'CDIV','amount'].sum()
 
-    # Print dataframe head for debugging
-    print("Market data after processing:", df.head())
+        # Simple weighting approach => assume mid-month => WCF = net_cf*0.5
+        # or do a daily-based approach if you want
+        wcf = net_cf * 0.5
 
-    return df
+        trans_agg.append({
+            'instrument': instr,
+            'year_month': ymonth,
+            'net_cf': net_cf,
+            'net_shares_change': net_shares_change,
+            'realized_pnl': realized_pnl,
+            'wcf': wcf
+        })
 
+    trans_df = pd.DataFrame(trans_agg)
+    return trans_df
+
+# 4) Calculate Monthly Asset Values
 def calculate_asset_values(transactions, market_data):
     """
-    Calculate asset values for each instrument and month.
+    Combine monthly transaction summaries with monthly market prices,
+    then compute:
+       - shares_bom / shares_eom
+       - price (we'll just have 1 monthly_price)
+       - net_cf, wcf, realized_pnl
+       - bom_nav, eom_nav, unrealized_pnl, average_capital
+       - as_of_date => last day of that month
     """
-    transactions['activity_date'] = pd.to_datetime(transactions['activity_date'])
-    transactions['as_of_date'] = transactions['activity_date'].apply(
-        lambda x: x.replace(day=monthrange(x.year, x.month)[1])
+    # 4.1 Summarize transactions by month
+    trans_df = summarize_transactions(transactions)
+
+    # 4.2 Merge with monthly market data
+    merged = pd.merge(
+        trans_df,
+        market_data,   # columns: [instrument, year_month, monthly_price]
+        on=['instrument','year_month'],
+        how='inner'    # only keep months that exist in both sets
     )
-    market_data['month_start'] = pd.to_datetime(market_data['month_start'])
 
-    asset_values = []
-    for instrument, group in transactions.groupby('instrument'):
-        instrument_data = market_data[market_data['instrument'] == instrument]
+    # 4.3 Sort by instrument, year_month so we can do a cumulative share approach
+    merged = merged.sort_values(['instrument','year_month'])
 
-        for as_of_date, monthly_txns in group.groupby('as_of_date'):
-            # Match the month for BOM and EOM prices
-            month_data = instrument_data[instrument_data['month_start'] == as_of_date.replace(day=1)]
+    # We'll track cumulative shares across months
+    merged['shares_bom'] = 0.0
+    merged['shares_eom'] = 0.0
 
-            if month_data.empty:
-                print(f"Warning: Still no market data available for {instrument} on {as_of_date}. Skipping.")
-                continue
+    def per_instrument_calc(group):
+        current_shares = 0.0
+        out_rows = []
+        for idx, row in group.iterrows():
+            row['shares_bom'] = current_shares
+            row['shares_eom'] = current_shares + row['net_shares_change']
+            current_shares = row['shares_eom']
+            out_rows.append(row)
+        return pd.DataFrame(out_rows)
 
-            bom_price = month_data['bom_price'].iloc[0]
-            eom_price = month_data['eom_price'].iloc[0]
+    merged = merged.groupby('instrument', group_keys=False).apply(per_instrument_calc).reset_index(drop=True)
 
-            shares_bom = monthly_txns['quantity'].cumsum().iloc[0]
-            shares_eom = monthly_txns['quantity'].cumsum().iloc[-1]
+    # 4.4 Compute nav, P&L, etc.
+    # We only have one monthly_price => treat that as eom_price
+    # For BOM price, either store the prior month’s price,
+    # or just use the same monthly_price for BOM & EOM. 
+    # Alternatively, keep a "rolling" approach so that "BOM_price" = last month's price. 
+    # We'll do a simple approach => BOM = prior month's monthly_price.
 
-            T = (as_of_date - as_of_date.replace(day=1)).days + 1
-            monthly_txns['t_i'] = (monthly_txns['activity_date'] - as_of_date.replace(day=1)).dt.days + 1
-            monthly_txns['W_i'] = (T - monthly_txns['t_i'] + 1) / T
-            monthly_txns['WCF_i'] = monthly_txns['W_i'] * monthly_txns['amount']
-            wcf = monthly_txns['WCF_i'].sum()
+    # SHIFT monthly_price down 1 month to get BOM price
+    merged['bom_price'] = merged.groupby('instrument')['monthly_price'].shift(1)
+    # if no prior month => fill first with the same as monthly_price or 0.0
+    merged['bom_price'] = merged.groupby('instrument')['bom_price'].fillna(merged['monthly_price'])
 
-            realized_pnl = monthly_txns[monthly_txns['event_type'] == 'CDIV']['amount'].sum()
-            net_cf = monthly_txns['amount'].sum()
-            unrealized_pnl = shares_eom * eom_price - shares_bom * bom_price - net_cf
-            bom_nav = shares_bom * bom_price
-            eom_nav = shares_eom * eom_price
-            average_capital = bom_nav + wcf
+    # eom_price is the current row's monthly_price
+    merged['eom_price'] = merged['monthly_price']
 
-            asset_values.append({
-                'as_of_date': as_of_date,
-                'instrument': instrument,
-                'shares_bom': shares_bom,
-                'shares_eom': shares_eom,
-                'price_bom': bom_price,
-                'price_eom': eom_price,
-                'bom_nav': bom_nav,
-                'eom_nav': eom_nav,
-                'net_cf': net_cf,
-                'wcf': wcf,
-                'realized_pnl': realized_pnl,
-                'unrealized_pnl': unrealized_pnl,
-                'average_capital': average_capital,
-            })
+    merged['bom_nav'] = merged['shares_bom'] * merged['bom_price']
+    merged['eom_nav'] = merged['shares_eom'] * merged['eom_price']
 
-    # Return as a DataFrame
-    asset_values_df = pd.DataFrame(asset_values)
-    return asset_values_df
+    # net_cf, wcf, realized_pnl already exist
+    merged['unrealized_pnl'] = merged['eom_nav'] - merged['bom_nav'] - merged['net_cf']
+    merged['average_capital'] = merged['bom_nav'] + merged['wcf']
 
+    # 4.5 as_of_date => last day of year_month
+    def last_day_of_period(period):
+        start_dt = period.to_timestamp(how='start')  # e.g. '2025-01-01'
+        days_in_month = monthrange(start_dt.year, start_dt.month)[1]
+        return start_dt.replace(day=days_in_month).date()
 
-def upsert_asset_values(asset_values):
-    """Insert or update the calculated asset values into the database."""
+    merged['as_of_date'] = merged['year_month'].apply(last_day_of_period)
+
+    # 4.6 Build final DataFrame
+    keep_cols = [
+        'as_of_date','instrument',
+        'shares_bom','shares_eom',
+        'bom_price','eom_price',
+        'bom_nav','eom_nav',
+        'net_cf','wcf',
+        'realized_pnl','unrealized_pnl','average_capital'
+    ]
+    final_df = merged[keep_cols].reset_index(drop=True)
+    return final_df
+
+# 5) Upsert logic
+def upsert_asset_values(df):
+    """
+    Insert or update rows in the 'asset_value' table
+    using (as_of_date, instrument) as the unique key.
+    """
+    if df.empty:
+        print("No asset values to upsert.")
+        return
+
     conn = get_connection()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
     upsert_sql = """
-    INSERT INTO asset_value (
-        as_of_date, instrument, shares_bom, shares_eom, price_bom, price_eom,
-        bom_nav, eom_nav, net_cf, wcf, realized_pnl, unrealized_pnl, average_capital
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (as_of_date, instrument) DO UPDATE SET
-        shares_bom = EXCLUDED.shares_bom,
-        shares_eom = EXCLUDED.shares_eom,
-        price_bom = EXCLUDED.price_bom,
-        price_eom = EXCLUDED.price_eom,
-        bom_nav = EXCLUDED.bom_nav,
-        eom_nav = EXCLUDED.eom_nav,
-        net_cf = EXCLUDED.net_cf,
-        wcf = EXCLUDED.wcf,
-        realized_pnl = EXCLUDED.realized_pnl,
-        unrealized_pnl = EXCLUDED.unrealized_pnl,
-        average_capital = EXCLUDED.average_capital;
+        INSERT INTO asset_value (
+            as_of_date, instrument,
+            shares_bom, shares_eom,
+            price_bom, price_eom,
+            bom_nav, eom_nav,
+            net_cf, wcf,
+            realized_pnl, unrealized_pnl,
+            average_capital
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (as_of_date, instrument)
+        DO UPDATE SET
+            shares_bom = EXCLUDED.shares_bom,
+            shares_eom = EXCLUDED.shares_eom,
+            price_bom  = EXCLUDED.price_bom,
+            price_eom  = EXCLUDED.price_eom,
+            bom_nav    = EXCLUDED.bom_nav,
+            eom_nav    = EXCLUDED.eom_nav,
+            net_cf     = EXCLUDED.net_cf,
+            wcf        = EXCLUDED.wcf,
+            realized_pnl   = EXCLUDED.realized_pnl,
+            unrealized_pnl = EXCLUDED.unrealized_pnl,
+            average_capital = EXCLUDED.average_capital
     """
 
-    asset_values['as_of_date'] = asset_values['as_of_date'].dt.date
+    # as_of_date => convert to date object (no time)
+    df['as_of_date'] = pd.to_datetime(df['as_of_date']).dt.date
 
-    records = asset_values.to_records(index=False)
-    cursor.executemany(upsert_sql, records)
+    records = df.to_records(index=False)
+    cur.executemany(upsert_sql, records)
+
     conn.commit()
-    cursor.close()
+    cur.close()
     conn.close()
 
+    print(f"Upserted {len(records)} asset_value rows.")
+
+# 6) Main entrypoint
 def main():
     print("Fetching transactions...")
-    transactions = fetch_transactions()
+    txns = fetch_transactions()
+    print(f"  Fetched {len(txns)} transaction rows.")
 
-    # Portfolio instruments
-    instruments = ['AAPL', 'CPNG', 'TSM', 'TOST', 'NU', 'NVO', 'MSFT', 'INTC', 'AMRC']
-    transactions = transactions[transactions['instrument'].isin(instruments)]
+    print("Fetching monthly market data (already monthly in DB)...")
+    market_data = fetch_monthly_market_data()
+    print(f"  Fetched {len(market_data)} monthly market rows.")
 
-    print("Fetching market data...")
-    market_data = fetch_market_data()
+    print("Calculating monthly asset values...")
+    df_asset = calculate_asset_values(txns, market_data)
+    print(f"  Computed {len(df_asset)} asset_value records.")
 
-    print("Calculating asset values...")
-    asset_values = calculate_asset_values(transactions, market_data)
+    # Quick peek
+    print(df_asset.head(10))
 
-    # Debugging: Ensure asset_values has expected columns
-    print(asset_values.head())
-    print(asset_values.columns)
-
-    print("Upserting asset values...")
-    upsert_asset_values(asset_values)
+    print("Upserting into asset_value table...")
+    upsert_asset_values(df_asset)
 
     print("Done.")
 
