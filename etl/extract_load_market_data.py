@@ -28,7 +28,7 @@ def get_connection():
 
 def truncate_market_data():
     """
-    Optional step #8: Truncate the market_data table to clear existing records
+    Optional step: Truncate the market_data table to clear existing records
     and reset its primary key before loading new data.
     """
     conn = get_connection()

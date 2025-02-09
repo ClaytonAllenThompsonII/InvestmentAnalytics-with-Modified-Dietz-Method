@@ -98,6 +98,24 @@ def none_if_nan(x):
     return x
 
 
+def transaction_priority(code):
+    """
+    Priority so that for the same date:
+      1) 'Buy', 'BTO', 'STO'  -> Opens (equity or options)
+      2) 'Sell', 'STC', 'BTC' -> Closes
+      3) 'OEXP'               -> Expiration
+      99) # Everything else (e.g. 'REC', 'ACH', 'OCA', etc.)
+    """
+    if code in ('Buy', 'BTO', 'STO'):
+        return 1
+    elif code in ('Sell', 'STC', 'BTC'):
+        return 2
+    elif code == 'OEXP':
+        return 3
+    else:
+        return 99
+
+
 def ingest_transactions(csv_file_path):
     """
     Reads the CSV, cleans data, and inserts into 'transactions' table,
@@ -138,6 +156,25 @@ def ingest_transactions(csv_file_path):
     df.loc[ach_mask, 'instrument'] = 'CASH'
     df.loc[ach_mask, 'quantity']   = 0
     df.loc[ach_mask, 'price']      = None
+
+    # If "REC" transaction has missing price, assume 0
+    rec_mask = (df['raw_trans_code'] == 'REC') & (df['price'].isnull())
+    df.loc[rec_mask, 'price']  = 0.0
+    df.loc[rec_mask, 'amount'] = 0.0
+
+    # 2B) Determine a custom priority so that on the same day,
+    # "Buy" rows appear before "Sell" rows
+    df['trans_priority'] = df['trans_code'].apply(transaction_priority)
+
+    # Keep track of original order to break ties beyond date + trans_priority
+    df['original_idx'] = df.index
+
+    # 2C) Sort the DataFrame
+    df.sort_values(
+        by=['activity_date', 'trans_priority', 'original_idx'],
+        ascending=True,
+        inplace=True
+    )
 
     # 3) Truncate table, then insert row by row
     truncate_sql = "TRUNCATE TABLE transactions RESTART IDENTITY;"
