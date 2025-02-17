@@ -8,6 +8,11 @@ WITH base_data AS (
         t.raw_trans_code,
         t.trans_code,
         t.instrument,
+        -- Add a normalized instrument column; for example, always normalize 'FB' to 'META'
+        CASE 
+            WHEN instrument = 'FB' THEN 'META'
+            ELSE instrument
+        END AS normalized_instrument,
         t.description,
         t.quantity,
         t.price,
@@ -103,6 +108,7 @@ SELECT
     raw_trans_code,
     trans_code,
     instrument,
+    normalized_instrument,
     description,
     quantity,
     price,

@@ -3,14 +3,14 @@ CREATE OR REPLACE VIEW enriched_transactions_agg AS
 WITH filtered_data AS (
     SELECT *
     FROM enriched_transactions_view
-    WHERE raw_trans_code IN ('Buy', 'Sell', 'CDIV', 'SPL')
+    WHERE raw_trans_code IN ('Buy', 'Sell', 'CDIV', 'SPL','DFEE','DTAX','REC') -- ADd other cash flows related to fees, taxes, but not CASH. 
 )
 SELECT
     /* 
      * Grouping dimensions:
      * One row per (instrument, period_start_date, period_end_date)
      */
-    instrument,
+    normalized_instrument as instrument,
     period_start_date,
     period_end_date,
 
@@ -49,22 +49,23 @@ SELECT
      * Each transaction is [raw_trans_code, corrected_activity_date, cash_flow].
      */
     COALESCE(
-      JSON_AGG(
-        JSON_BUILD_ARRAY(
-          raw_trans_code,
-          TO_CHAR(corrected_activity_date, 'YYYY-MM-DD'),
-          cash_flow,
-          weight
+    JSON_AGG(
+        JSON_BUILD_OBJECT(
+        'trans_code', raw_trans_code,
+        'date', TO_CHAR(corrected_activity_date, 'YYYY-MM-DD'),
+        'cash_flow', cash_flow,
+        'weight', ROUND(weight::numeric, 3),
+        'quantity', quantity
         )
-      ) FILTER (WHERE transaction_id IS NOT NULL),
-      '[]'::JSON
+    ) FILTER (WHERE transaction_id IS NOT NULL),
+    '[]'::JSON
     ) AS monthly_transactions
 
 FROM filtered_data
 GROUP BY
-    instrument,
+    normalized_instrument,
     period_start_date,
     period_end_date
 ORDER BY
-    instrument,
+    normalized_instrument,
     period_start_date;
