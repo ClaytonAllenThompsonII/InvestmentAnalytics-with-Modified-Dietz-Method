@@ -5,6 +5,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 from datetime import datetime
+
+
 from dotenv import load_dotenv
 
 # ------------------------------------------------------------------------------
@@ -422,6 +424,9 @@ def plot_portfolio_nav_area(df_port):
         template="plotly_white"
     )
     st.plotly_chart(fig_nav, use_container_width=True)
+
+
+
 
 # ------------------------------------------------------------------------------
 # 9) STREAMLIT DASHBOARD
