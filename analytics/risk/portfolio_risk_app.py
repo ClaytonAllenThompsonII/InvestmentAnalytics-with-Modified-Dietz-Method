@@ -121,7 +121,7 @@ def compute_instrument_beta_idio_vol(
 ) -> Tuple[float, float]:
     """
     Computes (beta, daily_idio_vol) by regressing instrument_returns on market_returns.
-    daily_idio_vol is the standard deviation of residuals from the OLS regression.
+    daily_idio_vol is the std dev of residuals from the OLS regression.
     """
     data = pd.concat([instrument_returns, market_returns], axis=1).dropna()
     data.columns = ['r_instrument', 'r_market']
@@ -226,6 +226,24 @@ def main():
         st.warning("No valid instrument data to compute portfolio metrics.")
         return
 
+    # ---------------------------
+    # Rename columns for better display (Instrument-Level)
+    # ---------------------------
+    col_map_instrument = {
+        'instrument': 'Ticker',
+        'shares': 'Shares',
+        'beta': 'Beta',
+        'daily_idio_vol': 'Daily Idio Vol',
+        'current_price': 'Current Price',
+        'net_market_value': 'Net Mkt Value (USD)',
+        'dollar_beta': 'Dollar Beta (USD)',
+        'dollar_idio_vol': 'Dollar Idio Vol (USD)'
+    }
+    results_df_aliased = results_df.rename(columns=col_map_instrument)
+
+    st.subheader("Instrument-Level Results")
+    st.dataframe(results_df_aliased)
+
     # Summaries
     portfolio_net_value = results_df['net_market_value'].sum()
     portfolio_dollar_beta = results_df['dollar_beta'].sum()
@@ -248,51 +266,69 @@ def main():
         tracking_error_pct = np.nan
 
     # ---------------------------
-    # Streamlit display
+    # Build your single-row summary, forcing floats, then rename
     # ---------------------------
-    st.subheader("Instrument-Level Results")
-    st.dataframe(results_df)
+    portfolio_summary_dict = {
+        "portfolio_net_value (USD)": float(portfolio_net_value),
+        "portfolio_dollar_beta (USD)": float(portfolio_dollar_beta),
+        "portfolio_beta_decimal": float(portfolio_beta_decimal) if not pd.isna(portfolio_beta_decimal) else np.nan,
+        "daily_market_vol (decimal)": float(market_vol),
+        "market_component_vol_usd": float(portfolio_market_component_vol),
+        "portfolio_idio_var_usd2": float(portfolio_idio_var),
+        "portfolio_idio_vol_usd (daily)": float(portfolio_idio_vol),
+        "portfolio_total_vol_usd (daily)": float(portfolio_total_vol),
+        "annual_tracking_vol_usd": float(annual_tracking_vol_usd),
+        "tracking_error (%)": float(tracking_error_pct),
+    }
+    summary_df = pd.DataFrame([portfolio_summary_dict])
 
-    # Create a single-row DataFrame for portfolio summary
-    portfolio_summary = pd.DataFrame([{
-        "portfolio_net_value (USD)": portfolio_net_value,
-        "portfolio_dollar_beta (USD)": portfolio_dollar_beta,
-        "portfolio_beta_decimal": portfolio_beta_decimal,
-        "daily_market_vol (decimal)": market_vol,
-        "market_component_vol_usd": portfolio_market_component_vol,
-        "portfolio_idio_var_usd2": portfolio_idio_var,
-        "portfolio_idio_vol_usd (daily)": portfolio_idio_vol,
-        "portfolio_total_vol_usd (daily)": portfolio_total_vol,
-        "annual_tracking_vol_usd": annual_tracking_vol_usd,
-        "tracking_error (%)": tracking_error_pct
-    }])
+    # 2) rename columns => user-friendly
+    alias_summary = {
+        "portfolio_net_value (USD)": "Net Portfolio Value ($)",
+        "portfolio_dollar_beta (USD)": "Total Dollar Beta ($)",
+        "portfolio_beta_decimal": "Portfolio Beta (ratio)",
+        "daily_market_vol (decimal)": "Daily Market Vol (decimal)",
+        "market_component_vol_usd": "Market Component Vol ($)",
+        "portfolio_idio_var_usd2": "Idio Variance ($^2)",
+        "portfolio_idio_vol_usd (daily)": "Daily Idio Vol ($)",
+        "portfolio_total_vol_usd (daily)": "Daily Portfolio Vol ($)",
+        "annual_tracking_vol_usd": "Annual Tracking Vol ($)",
+        "tracking_error (%)": "Tracking Error (%)"
+    }
+    summary_df_aliased = summary_df.rename(columns=alias_summary)
+
+    # 3) transpose
+    transposed_df = summary_df_aliased.T.reset_index()
+    transposed_df.columns = ["Metric", "Value"]
 
     st.subheader("Portfolio-Level Summary")
-    st.dataframe(portfolio_summary)
+    st.dataframe(transposed_df)
 
+    # ---------------------------
     # Plotly bar charts
+    # ---------------------------
     st.subheader("Net Market Value by Instrument")
     # Sort to have largest bars first
-    results_df_sorted = results_df.sort_values("net_market_value", ascending=False)
+    df_sorted_nmv = results_df_aliased.sort_values("Net Mkt Value (USD)", ascending=False)
     fig_nmv = px.bar(
-        results_df_sorted,
-        x="instrument",
-        y="net_market_value",
+        df_sorted_nmv,
+        x="Ticker",
+        y="Net Mkt Value (USD)",
         title="Net Market Value (USD)",
-        color="instrument",
-        labels={"instrument": "Instrument", "net_market_value": "Net Mkt Value (USD)"}
+        color="Ticker",
+        labels={"Ticker": "Instrument", "Net Mkt Value (USD)": "Net Mkt Value (USD)"}
     )
     st.plotly_chart(fig_nmv, use_container_width=True)
 
     st.subheader("Dollar Beta by Instrument")
-    results_df_sorted2 = results_df.sort_values("dollar_beta", ascending=False)
+    df_sorted_beta = results_df_aliased.sort_values("Dollar Beta (USD)", ascending=False)
     fig_beta = px.bar(
-        results_df_sorted2,
-        x="instrument",
-        y="dollar_beta",
+        df_sorted_beta,
+        x="Ticker",
+        y="Dollar Beta (USD)",
         title="Dollar Beta (USD Exposure)",
-        color="instrument",
-        labels={"instrument": "Instrument", "dollar_beta": "Dollar Beta (USD)"}
+        color="Ticker",
+        labels={"Ticker": "Instrument", "Dollar Beta (USD)": "Dollar Beta (USD)"}
     )
     st.plotly_chart(fig_beta, use_container_width=True)
 

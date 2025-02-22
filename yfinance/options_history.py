@@ -1,6 +1,6 @@
 import yfinance as yf
 
-# The specific contract symbol for NU Mar 21 2025 11.0 Call
+# The specific contract symbol for NU Mar 21 2025 11.0 Call | NU 3/21/2025 Call $11.00
 contract_symbol = "NU250321C00011000"
 
 # Create a Ticker object for the option contract
