@@ -229,5 +229,6 @@ def ingest_transactions(csv_file_path):
 
 
 if __name__ == "__main__":
-    csv_path = "/Users/claytonthompson/Desktop/portfolio_tx.csv"  # Update as needed
+    # Robinhood CSV file for all transactions from direct investing account
+    csv_path = "/Users/claytonthompson/Projects/InvestmentAnalytics/data/raw/robinhood/robinhood_transactions.csv"
     ingest_transactions(csv_path)
