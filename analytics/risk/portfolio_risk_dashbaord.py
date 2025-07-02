@@ -5,7 +5,6 @@ import logging
 import psycopg2
 from dotenv import load_dotenv
 import pandas as pd
-import yfinance as yf
 import statsmodels.api as sm
 import numpy as np
 from datetime import datetime, timedelta
@@ -96,23 +95,16 @@ def get_open_positions():
 # 3. Market Data & Regression Helpers
 # -----------------------------------------------------------------------
 
-def fetch_daily_returns(ticker: str, start_date: datetime, end_date: datetime) -> pd.Series:
+def fetch_daily_returns_db(symbol: str, start_date: datetime, end_date: datetime) -> pd.Series:
+    query = """
+        SELECT price_date, close_price FROM market_data
+        WHERE instrument = %s AND price_date BETWEEN %s AND %s
+        ORDER BY price_date;
     """
-    Downloads (auto-adjusted) close prices for the given ticker (via yfinance)
-    and returns a Series of daily % returns from the 'Close' column.
-    """
-    try:
-        df = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
-    except Exception as e:
-        logging.error("Error fetching data for %s: %s", ticker, e)
-        return pd.Series(dtype='float64')
-
-    if df.empty:
-        logging.warning("No data returned for %s in the given date range.", ticker)
-        return pd.Series(dtype='float64')
-
-    returns = df['Close'].pct_change().dropna()
-    return returns
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn, params=(symbol, start_date, end_date))
+    df.set_index('price_date', inplace=True)
+    return df['close_price'].pct_change().dropna()
 
 
 def compute_instrument_beta_idio_vol(instrument_returns: pd.Series,
@@ -138,29 +130,16 @@ def compute_instrument_beta_idio_vol(instrument_returns: pd.Series,
     return beta, resid_std
 
 
-def fetch_current_price(ticker: str) -> float:
+def fetch_current_price_db(symbol: str) -> float:
+    query = """
+        SELECT close_price FROM market_data
+        WHERE instrument = %s ORDER BY price_date DESC LIMIT 1;
     """
-    Fetch the most recent adjusted close price (1d) from yfinance.
-    """
-    try:
-        df = yf.download(ticker, period="1d", progress=False, auto_adjust=True)
-    except Exception as e:
-        logging.error("Error fetching current price for %s: %s", ticker, e)
-        return np.nan
-
-    if df.empty:
-        logging.warning("No current price for ticker %s.", ticker)
-        return np.nan
-
-    # Convert to float to avoid it being a single-element Series
-    try:
-        last_close = float(df['Close'].iloc[-1])
-    except (TypeError, ValueError) as err:
-        logging.warning("Could not parse final row for %s: %s", ticker, err)
-        return np.nan
-
-    return last_close
-
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (symbol,))
+            result = cur.fetchone()
+    return float(result[0]) if result else np.nan
 
 # -----------------------------------------------------------------------
 # 4. Main Calculation Logic
@@ -193,12 +172,12 @@ def main():
     start_date = end_date - timedelta(days=365*2)
 
     # C) Fetch SPY returns for reference (market)
-    spy_returns = fetch_daily_returns("SPY", start_date, end_date)
+    spy_returns = fetch_daily_returns_db("SPY", start_date, end_date)
     if spy_returns.empty:
         logging.error("No market data (SPY) retrieved. Cannot proceed.")
         return
 
-    market_vol = spy_returns.std()  # daily market volatility (decimal)
+    market_vol = spy_returns.std()
 
     # D) For each instrument: compute Beta & daily idiosyncratic vol, get net market value, etc.
     results = []
@@ -206,14 +185,14 @@ def main():
         instrument = row['instrument']
         total_shares = float(row['total_open_quantity'])
 
-        inst_returns = fetch_daily_returns(instrument, start_date, end_date)
+        inst_returns = fetch_daily_returns_db(instrument, start_date, end_date)
         if inst_returns.empty:
             logging.warning("Skipping %s due to no return data.", instrument)
             continue
 
         beta, daily_idio_vol = compute_instrument_beta_idio_vol(inst_returns, spy_returns)
 
-        curr_price = fetch_current_price(instrument)
+        curr_price = fetch_current_price_db(instrument)
         if np.isnan(curr_price):
             logging.warning("Skipping %s due to no current price.", instrument)
             continue
@@ -233,50 +212,21 @@ def main():
             'dollar_idio_vol': dollar_idio_vol
         })
 
-    # Convert results to DataFrame
     results_df = pd.DataFrame(results)
     if results_df.empty:
         logging.error("No valid instrument data to compute portfolio metrics.")
         return
 
-    # E) Summaries
-    # 1) Total net market value
     portfolio_net_value = results_df['net_market_value'].sum()
-
-    # 2) Summation of Dollar Betas (absolute measure)
     portfolio_dollar_beta = results_df['dollar_beta'].sum()
-
-    # 3) "Portfolio Beta" as ratio
-    if portfolio_net_value > 0:
-        portfolio_beta_decimal = portfolio_dollar_beta / portfolio_net_value
-    else:
-        portfolio_beta_decimal = np.nan
-
-    # 4) Market component of vol (in USD)
+    portfolio_beta_decimal = portfolio_dollar_beta / portfolio_net_value if portfolio_net_value > 0 else np.nan
     portfolio_market_component_vol = portfolio_dollar_beta * market_vol
-
-    # 5) Idio vol in USD (assuming zero correlation among instruments)
     portfolio_idio_var = (results_df['dollar_idio_vol'] ** 2).sum()
-    portfolio_idio_vol = np.sqrt(portfolio_idio_var)  # daily
-
-    # 6) Total portfolio vol (assuming zero correlation with market)
-    portfolio_total_vol = np.sqrt(
-        portfolio_market_component_vol**2 + portfolio_idio_vol**2
-    )
-
-    # -------------------------------------------------------------------
-    #  New: Tracking Dollar Vol, Annualized, and % of Net Value
-    # -------------------------------------------------------------------
-    # daily tracking vol in USD = portfolio_idio_vol
-    # annualized = daily * sqrt(252)
+    portfolio_idio_vol = np.sqrt(portfolio_idio_var)
+    portfolio_total_vol = np.sqrt(portfolio_market_component_vol**2 + portfolio_idio_vol**2)
     annual_tracking_vol_usd = portfolio_idio_vol * np.sqrt(252)
+    tracking_error_pct = (annual_tracking_vol_usd / portfolio_net_value) * 100.0 if portfolio_net_value > 0 else np.nan
 
-    if portfolio_net_value > 0:
-        tracking_error_pct = (annual_tracking_vol_usd / portfolio_net_value) * 100.0
-    else:
-        tracking_error_pct = np.nan
-
-    # F) Log output to console
     logging.info("=== Instrument-Level Results ===")
     logging.info("\n%s", results_df.to_string(index=False))
 
@@ -294,15 +244,11 @@ def main():
     logging.info("Annual Tracking Vol (USD):          %.2f", annual_tracking_vol_usd)
     logging.info("Tracking Error (%% of NMV):          %.2f%%", tracking_error_pct)
 
-    # -------------------------------------------------------------------
-    #  Visualize: Simple Bar Charts of Net Market Value & Dollar Beta
-    # -------------------------------------------------------------------
+    # Visualization
     results_df.sort_values('net_market_value', ascending=False, inplace=True)
-
     instruments = results_df['instrument'].tolist()
     x_pos = np.arange(len(instruments))
 
-    # First figure: Net Market Value per instrument
     fig, ax = plt.subplots()
     ax.bar(x_pos, results_df['net_market_value'], color='steelblue', alpha=0.7)
     ax.set_title('Net Market Value by Instrument')
@@ -313,7 +259,6 @@ def main():
     plt.tight_layout()
     plt.show()
 
-    # Second figure: Dollar Beta per instrument
     fig2, ax2 = plt.subplots()
     ax2.bar(x_pos, results_df['dollar_beta'], color='darkorange', alpha=0.7)
     ax2.set_title('Dollar Beta by Instrument')
@@ -323,9 +268,6 @@ def main():
     ax2.set_xticklabels(instruments, rotation=45, ha='right')
     plt.tight_layout()
     plt.show()
-
-    # (Optional) You could also add a third figure for daily_idio_vol or annual tracking vol if desired.
-
 
 # -----------------------------------------------------------------------
 # 5. Script Entry Point

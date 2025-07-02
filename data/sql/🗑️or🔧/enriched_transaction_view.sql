@@ -1,5 +1,4 @@
 CREATE OR REPLACE VIEW enriched_transactions_agg AS
-
 WITH time_index AS (
     SELECT 
         ts.instrument,
@@ -46,9 +45,6 @@ SELECT
 
     COALESCE(SUM(cash_flow), 0) AS net_cash_flow,
     COALESCE(SUM(cash_flow * weight), 0) AS weighted_cash_flow,
-    COALESCE(SUM(
-        CASE WHEN raw_trans_code IN ('DFEE', 'DTAX') THEN cash_flow ELSE 0 END
-        ), 0) AS fees_and_taxes,
 
     COALESCE(
         JSON_AGG(

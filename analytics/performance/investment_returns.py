@@ -1,513 +1,291 @@
+#!/usr/bin/env python3
+
 import os
+import logging
 import psycopg2
-import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import streamlit as st
-from datetime import datetime
-
-
 from dotenv import load_dotenv
+import pandas as pd
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
 
 # ------------------------------------------------------------------------------
-# CONFIGURATION: LOAD DATABASE CREDENTIALS
+# LOAD ENV + SETUP LOGGING
 # ------------------------------------------------------------------------------
-load_dotenv()  # Load DB credentials from .env
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
+load_dotenv()
 
-# ------------------------------------------------------------------------------
-# CUSTOM CSS FOR A MINIMAL DESIGN (Inspired by Dieter Rams)
-# ------------------------------------------------------------------------------
-CUSTOM_CSS = """
-<style>
-/* Minimal background and neutral text color */
-body {
-    background-color: #F9F9F9;
-    color: #333;
-    font-family: "Helvetica Neue", Arial, sans-serif;
-}
-
-/* Make main title (h1) bigger & bolder */
-h1 {
-    font-size: 2.0rem !important;
-    font-weight: 700 !important;
-    margin-bottom: 0.5rem !important;
-}
-
-/* Subheader or section titles a bit larger, minimal margin */
-h2, .stMarkdown h2 {
-    font-size: 1.4rem !important;
-    font-weight: 600 !important;
-    margin-top: 1.0rem !important;
-    margin-bottom: 0.6rem !important;
-}
-
-/* DataFrame table styling */
-table {
-    background-color: #FFF;
-    border-collapse: collapse;
-    width: 100%;
-}
-thead tr {
-    background-color: #ECECEC;
-}
-tbody tr:nth-child(even) {
-    background-color: #F3F3F3;
-}
-td, th {
-    padding: 8px 12px;
-    border: 1px solid #DDD;
-}
-
-/* Streamlit main container spacing */
-.block-container {
-    padding: 1rem 2rem !important;
-}
-
-/* Buttons / widget styling */
-.stButton button {
-    background-color: #666 !important;
-    color: #FFF !important;
-    border-radius: 4px !important;
-    border: none !important;
-    padding: 0.4rem 1rem !important;
-}
-</style>
-"""
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
 
 # ------------------------------------------------------------------------------
-# HELPER: DATABASE CONNECTION
+# DATABASE CONNECTION
 # ------------------------------------------------------------------------------
 def get_connection():
-    """Establish and return a connection to the database."""
-    try:
-        return psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD
-        )
-    except psycopg2.Error as e:
-        st.error(f"Database connection failed: {e}")
-        return None
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD")
+    )
 
 # ------------------------------------------------------------------------------
-# 1) FETCH INSTRUMENT-LEVEL MONTHLY DATA (OPEN POSITIONS ONLY)
+# CORE FUNCTIONS
 # ------------------------------------------------------------------------------
-def fetch_open_instrument_monthly_data():
-    """
-    Pull monthly asset value data for instruments with open positions.
-    This query uses asset_value_view joined with a CTE that finds, for each 
-    instrument, the earliest lot_open_date (from fifo_equity_lots) when shares 
-    were opened. Only monthly rows on or after that first open date are returned.
-    """
+def get_asset_performance_data():
     query = """
-        WITH open_instruments AS (
-            SELECT
-                instrument,
-                MIN(lot_open_date) AS first_open_date
-            FROM fifo_equity_lots
-            WHERE open_quantity > 0
-            GROUP BY instrument
-        )
-        SELECT av.*
-        FROM asset_value_view av
-        JOIN open_instruments oi
-          ON av.instrument = oi.instrument
-        WHERE av.period_end_date >= oi.first_open_date
-        ORDER BY av.instrument, av.period_end_date;
+        SELECT *
+        FROM asset_performance_view
+        ORDER BY instrument, period_end_date
     """
-    conn = get_connection()
-    if conn is None:
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_sql_query(query, conn)
-        conn.close()
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn)
         df["period_end_date"] = pd.to_datetime(df["period_end_date"])
         return df
-    except Exception as e:
-        st.error(f"Error fetching open instrument monthly data: {e}")
-        return pd.DataFrame()
 
-# ------------------------------------------------------------------------------
-# 2) (OPTIONAL) FETCH PORTFOLIO-LEVEL MONTHLY DATA
-# ------------------------------------------------------------------------------
-def fetch_portfolio_monthly():
-    """
-    Dynamically compute portfolio-level monthly data by aggregating from asset_value_view.
-    Sums BOM/EOM NAV, net cash flow, and weighted cash flow across all instruments
-    for each month, then calculates a portfolio-level Modified Dietz return.
-    """
+def get_current_position_start_from_lots(instrument: str) -> pd.Timestamp:
     query = """
-        WITH portfolio_monthly AS (
-            SELECT
-                av.period_end_date,
-                SUM(av.nav_bom) AS portfolio_bom,
-                SUM(av.nav_eom) AS portfolio_eom,
-                SUM(av.net_cash_flow) AS total_net_flow,
-                SUM(av.weighted_cash_flow) AS total_weighted_flow
-            FROM asset_value_view av
-            GROUP BY av.period_end_date
-        )
-        SELECT
-            pm.period_end_date,
-            pm.portfolio_bom,
-            pm.portfolio_eom,
-            pm.total_net_flow,
-            CASE
-                WHEN (pm.portfolio_bom + pm.total_weighted_flow) <> 0
-                THEN ROUND(
-                    (
-                        (pm.portfolio_eom - pm.portfolio_bom - pm.total_net_flow)
-                        / (pm.portfolio_bom + pm.total_weighted_flow)
-                    )::numeric,
-                    6
-                )
-                ELSE NULL
-            END AS md_return
-        FROM portfolio_monthly pm
-        ORDER BY pm.period_end_date
+        SELECT MIN(lot_open_date) AS start_date
+        FROM fifo_equity_lots
+        WHERE instrument = %s AND open_quantity > 0
     """
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn, params=(instrument,))
+        if df.empty or pd.isna(df.iloc[0]["start_date"]):
+            return None
+        return pd.to_datetime(df.iloc[0]["start_date"])
 
-    conn = get_connection()
-    if conn is None:
-        return pd.DataFrame()
-
-    try:
-        df_port = pd.read_sql_query(query, conn)
-        conn.close()
-        df_port["period_end_date"] = pd.to_datetime(df_port["period_end_date"])
-        return df_port
-    except Exception as e:
-        st.warning(f"Error fetching portfolio data: {e}")
-        return pd.DataFrame()
-
-# ------------------------------------------------------------------------------
-# 3) HELPER: CALCULATE TIME-WEIGHTED RETURN (TWR)
-# ------------------------------------------------------------------------------
-def calculate_twr_from_monthly(df, monthly_return_col="md_return"):
-    """
-    Compute the geometric link of monthly returns:
-      TWR = Π(1 + monthly_return) - 1
-    Replaces NaN with 0.
-    """
+def calculate_twr_from_monthly(df, return_col="md_return_net"):
     if df.empty:
         return None
-    product_factor = (1 + df[monthly_return_col].fillna(0)).prod()
-    return product_factor - 1
+    return (1 + df[return_col].fillna(0)).prod() - 1
 
-def calculate_trailing_return(df, months, date_col="period_end_date", monthly_return_col="md_return"):
-    """
-    Restrict DataFrame to the last 'months' months and compute TWR.
-    For T2Y (24 months), return None if fewer than 24 records.
-    """
+def calculate_trailing_return(df, months, return_col="md_return_net", instrument=None):
+    if df.empty:
+        return None, None
+
+    max_date = df["period_end_date"].max()
+    cutoff = max_date - relativedelta(months=months)
+
+    # Get position start date
+    start_date = None
+    if instrument:
+        start_date = get_current_position_start_from_lots(instrument)
+
+    # Subset for trailing period
+    subset = df[df["period_end_date"] > cutoff]
+
+    if start_date:
+        subset = subset[subset["period_end_date"] >= start_date]
+
+    if subset.empty:
+        return None, "SI"
+
+    raw_return = calculate_twr_from_monthly(subset, return_col)
+    actual_months = subset["period_end_date"].nunique()
+
+    # Determine label based on actual months
+    if actual_months < months:
+        if actual_months >= 12:
+            ann_return = (1 + raw_return) ** (12 / actual_months) - 1
+            return ann_return, "Ann."
+        else:
+            return raw_return, "SI"
+
+    return raw_return, None
+
+def calculate_trailing_return_from_daily(df, months):
     if df.empty:
         return None
-    max_date = df[date_col].max()
-    if pd.isnull(max_date):
+
+    df = df.sort_values("price_date").copy()
+    latest_date = df["price_date"].max()
+    cutoff_date = latest_date - relativedelta(months=months)
+
+    subset = df[df["price_date"] >= cutoff_date]
+    if subset.empty or len(subset) < 2:
         return None
 
-    cutoff_date = max_date - pd.DateOffset(months=months)
-    slice_df = df[df[date_col] > cutoff_date]
+    start_price = subset["close_price"].iloc[0]
+    end_price = subset["close_price"].iloc[-1]
 
-    if monthly_return_col == "md_return" and months == 24 and len(slice_df) < 24:
+    if start_price == 0 or pd.isna(start_price) or pd.isna(end_price):
         return None
 
-    return calculate_twr_from_monthly(slice_df, monthly_return_col=monthly_return_col)
+    return (end_price / start_price) - 1
 
-# ------------------------------------------------------------------------------
-# 4) BUILD INSTRUMENT-LEVEL SUMMARY
-# ------------------------------------------------------------------------------
 def build_instrument_summary(df):
-    """
-    Build a summary DataFrame at the instrument level from monthly data.
-    Computes MTD, QTD, T3M, YTD, TTM, T2Y, LTD returns, plus latest open shares.
-    """
-    summary_rows = []
+    summary = []
 
-    for instrument, grp in df.groupby("instrument"):
-        grp = grp.sort_values("period_end_date")
-        if grp.empty:
+    for instrument, group in df.groupby("instrument"):
+        group = group.sort_values("period_end_date").copy()
+        if group.empty:
             continue
 
-        latest_date = grp["period_end_date"].max()
+        start_date = get_current_position_start_from_lots(instrument)
+        logging.info(f"{instrument}: Active position start = {start_date.date() if start_date else 'N/A'}")
+        if start_date:
+            group = group[group["period_end_date"] >= start_date]
+        if group.empty:
+            continue
 
-        # MTD: from the first day of the latest month
-        mtd_start = latest_date.replace(day=1)
-        mtd_slice = grp[grp["period_end_date"] >= mtd_start]
+        latest = group["period_end_date"].max()
+        mtd_start = latest.replace(day=1)
+        qtd_start = latest.replace(day=1) - relativedelta(months=(latest.month - 1) % 3)
+        ytd_start = latest.replace(month=1, day=1)
 
-        # QTD: from start of current quarter
-        current_month = latest_date.month
-        months_into_quarter = (current_month - 1) % 3
-        qtd_start = latest_date.replace(day=1) - pd.DateOffset(months=months_into_quarter)
-        qtd_slice = grp[grp["period_end_date"] >= qtd_start]
+        t3m_val, t3m_flag = calculate_trailing_return(group, 3, instrument=instrument)
+        ttm_val, ttm_flag = calculate_trailing_return(group, 12, instrument=instrument)
+        t2y_val, t2y_flag = calculate_trailing_return(group, 24, instrument=instrument)
 
-        # T3M
-        t3m = calculate_trailing_return(grp, 3)
-        # YTD
-        ytd_start = latest_date.replace(month=1, day=1)
-        ytd_slice = grp[grp["period_end_date"] >= ytd_start]
-        # TTM
-        ttm = calculate_trailing_return(grp, 12)
-        # T2Y
-        t2y = calculate_trailing_return(grp, 24) if len(grp) >= 24 else None
-        # LTD
-        ltd = calculate_twr_from_monthly(grp)
+        def fmt(val, flag):
+            if val is None:
+                return " " * 6 + "-"  # 6 spaces to match annotation space
+            pct_str = f"{val:>7.2%}"  # Right-align the percentage (7 total chars e.g. 123.45%)
+            if flag == "SI":
+                return f"{'SI':<6}{pct_str}"  # 'SI' left-aligned in 6-char field
+            elif flag == "Ann.":
+                return f"{'Ann.':<6}{pct_str}"
+            else:
+                return " " * 6 + pct_str
 
-        # If eom_shares_cumulative is present, get the latest
-        total_shares = None
-        if "eom_shares_cumulative" in grp.columns:
-            total_shares = grp.iloc[-1]["eom_shares_cumulative"]
-
-        summary_rows.append({
-            "Instrument": instrument,
-            "MTD": calculate_twr_from_monthly(mtd_slice),
-            "QTD": calculate_twr_from_monthly(qtd_slice),
-            "T3M": t3m,
-            "YTD": calculate_twr_from_monthly(ytd_slice),
-            "TTM": ttm,
-            "T2Y": t2y,
-            "LTD": ltd,
-            "Total Shares": total_shares
+        summary.append({
+            "instrument": instrument,
+            "MTD": fmt(calculate_twr_from_monthly(group[group["period_end_date"] >= mtd_start]), None),
+            "QTD": fmt(calculate_twr_from_monthly(group[group["period_end_date"] >= qtd_start]), None),
+            "T3M": fmt(t3m_val, t3m_flag),
+            "YTD": fmt(calculate_twr_from_monthly(group[group["period_end_date"] >= ytd_start]), None),
+            "TTM": fmt(ttm_val, ttm_flag),
+            "T2Y": fmt(t2y_val, t2y_flag),
+            "LTD": fmt(calculate_twr_from_monthly(group), None),
+            "Latest NAV": group["nav_eom"].iloc[-1],
+            "Total Shares": group["eom_shares_cumulative"].iloc[-1] if "eom_shares_cumulative" in group.columns else None
         })
 
-    return pd.DataFrame(summary_rows)
+    return pd.DataFrame(summary)
 
-# ------------------------------------------------------------------------------
-# 5) FETCH COST-BASED RETURNS
-# ------------------------------------------------------------------------------
-def fetch_cost_based_returns():
-    """
-    Aggregates total cost from fifo_equity_lots and retrieves
-    the latest nav_eom from asset_value_view_open_positions,
-    then computes total_pnl and cost_based_return.
-    """
+def get_benchmark_data(benchmark="SPY"):
     query = """
-        WITH total_costs AS (
-          SELECT 
-            instrument,
-            SUM(total_cost) AS total_cost
-          FROM fifo_equity_lots
-          GROUP BY instrument
-        ),
-        latest_nav AS (
-          SELECT av.instrument, av.nav_eom
-          FROM asset_value_view_open_positions av
-          JOIN (
-              SELECT instrument, MAX(period_end_date) AS latest_date
-              FROM asset_value_view_open_positions
-              GROUP BY instrument
-          ) ln ON av.instrument = ln.instrument 
-             AND av.period_end_date = ln.latest_date
-        )
-        SELECT 
-          tc.instrument,
-          tc.total_cost,
-          (ln.nav_eom - tc.total_cost) AS total_pnl,
-          CASE 
-            WHEN tc.total_cost <> 0 THEN (ln.nav_eom - tc.total_cost) / tc.total_cost
-            ELSE NULL 
-          END AS cost_based_return
-        FROM total_costs tc
-        JOIN latest_nav ln 
-          ON tc.instrument = ln.instrument;
+        SELECT price_date, close_price
+        FROM market_data
+        WHERE instrument = %s
+        AND price_date >= CURRENT_DATE - INTERVAL '60 months'
+        ORDER BY price_date
     """
-    conn = get_connection()
-    if conn is None:
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_sql_query(query, conn)
-        conn.close()
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn, params=(benchmark,))
+        df["price_date"] = pd.to_datetime(df["price_date"])
         return df
-    except Exception as e:
-        st.error(f"Error fetching cost-based returns: {e}")
-        return pd.DataFrame()
+
+    if df.empty:
+        return None, None
+
+    start_date = None
+    if instrument:
+        start_date = get_current_position_start_from_lots(instrument)
+        if start_date:
+            df = df[df["period_end_date"] >= start_date]
+        if df.empty:
+            return None, None
+
+    max_date = df["period_end_date"].max()
+    cutoff = max_date - relativedelta(months=months)
+
+    subset = df[df["period_end_date"] > cutoff]
+    if subset.empty:
+        return None, None
+
+    raw_return = calculate_twr_from_monthly(subset, return_col)
+
+    # ✅ Key fix: If position was opened AFTER the trailing window, it's SI
+    if start_date and start_date > cutoff:
+        return raw_return, "SI"
+
+    # ✅ Optional: if months >= 12 and data is sparse, annualize
+    if months >= 12 and subset["period_end_date"].nunique() < months:
+        annualized = (1 + raw_return) ** (12 / subset["period_end_date"].nunique()) - 1
+        return annualized, "Ann."
+
+    return raw_return, None
+
+def build_benchmark_summary(df, name="Benchmark"):
+    df = df.sort_values("price_date")
+    latest = df["price_date"].max()
+    mtd_start = latest.replace(day=1)
+    qtd_start = latest.replace(day=1) - pd.DateOffset(months=(latest.month - 1) % 3)
+    ytd_start = latest.replace(month=1, day=1)
+
+    return pd.DataFrame([{
+        "instrument": name,
+        "MTD": calculate_trailing_return_from_daily(df[df["price_date"] >= mtd_start], 1),
+        "QTD": calculate_trailing_return_from_daily(df[df["price_date"] >= qtd_start], 3),
+        "T3M": calculate_trailing_return_from_daily(df, 3),
+        "YTD": calculate_trailing_return_from_daily(df[df["price_date"] >= ytd_start], 6),
+        "TTM": calculate_trailing_return_from_daily(df, 12),
+        "T2Y": calculate_trailing_return_from_daily(df, 24),
+        "T5Y": calculate_trailing_return_from_daily(df, 60)
+    }])
+
+def print_table_with_lines(df):
+    col_names = df.columns.tolist()
+    
+    # Build header
+    header = " | ".join([f"{col:<15}" for col in col_names])
+    separator = "-+-".join(["-" * 15 for _ in col_names])
+
+    print(header)
+    print(separator)
+
+    # Print each row
+    for _, row in df.iterrows():
+        line = " | ".join([f"{str(val):<15}" for val in row])
+        print(line)
 
 # ------------------------------------------------------------------------------
-# 6) FORMAT RETURNS AS PERCENTAGES
-# ------------------------------------------------------------------------------
-def format_as_percentage(df, columns=None):
-    """
-    Convert decimal returns (e.g. 0.05) to percentage strings (e.g. '5.00%').
-    """
-    if columns is None:
-        columns = ["MTD", "QTD", "T3M", "YTD", "TTM", "T2Y", "LTD", "cost_based_return"]
-
-    df_formatted = df.copy()
-    for col in columns:
-        if col in df_formatted.columns:
-            df_formatted[col] = df_formatted[col].apply(
-                lambda x: f"{x*100:.2f}%" if pd.notnull(x) else "N/A"
-            )
-    return df_formatted
-
-# ------------------------------------------------------------------------------
-# 7) (OPTIONAL) BUILD PORTFOLIO SUMMARY
-# ------------------------------------------------------------------------------
-def build_portfolio_summary(df_port):
-    """
-    Creates a single-row summary (PORTFOLIO) from the monthly portfolio data,
-    computing MTD, QTD, T3M, YTD, TTM, T2Y, LTD, etc.
-    """
-    if df_port.empty:
-        return pd.DataFrame()
-
-    df_port = df_port.sort_values("period_end_date")
-    latest_date = df_port["period_end_date"].max()
-
-    # MTD
-    mtd_start = latest_date.replace(day=1)
-    mtd_slice = df_port[df_port["period_end_date"] >= mtd_start]
-
-    # QTD
-    current_month = latest_date.month
-    months_into_quarter = (current_month - 1) % 3
-    qtd_start = latest_date.replace(day=1) - pd.DateOffset(months=months_into_quarter)
-    qtd_slice = df_port[df_port["period_end_date"] >= qtd_start]
-
-    # T3M
-    t3m = calculate_trailing_return(df_port, 3)
-    # YTD
-    ytd_start = latest_date.replace(month=1, day=1)
-    ytd_slice = df_port[df_port["period_end_date"] >= ytd_start]
-    # TTM
-    ttm = calculate_trailing_return(df_port, 12)
-    # T2Y
-    t2y = calculate_trailing_return(df_port, 24) if len(df_port) >= 24 else None
-    # LTD
-    ltd = calculate_twr_from_monthly(df_port)
-
-    row = {
-        "Instrument": "PORTFOLIO",
-        "MTD": calculate_twr_from_monthly(mtd_slice),
-        "QTD": calculate_twr_from_monthly(qtd_slice),
-        "T3M": t3m,
-        "YTD": calculate_twr_from_monthly(ytd_slice),
-        "TTM": ttm,
-        "T2Y": t2y,
-        "LTD": ltd,
-        "Total Shares": None
-    }
-    return pd.DataFrame([row])
-
-# ------------------------------------------------------------------------------
-# 8) AREA CHART FOR PORTFOLIO EOM NAV
-# ------------------------------------------------------------------------------
-def plot_portfolio_nav_area(df_port):
-    """
-    Plot an area chart showing the portfolio's EOM NAV over time.
-    """
-    if df_port.empty:
-        st.warning("No portfolio data to plot for NAV EOM.")
-        return
-
-    fig_nav = go.Figure()
-    fig_nav.add_trace(go.Scatter(
-        x=df_port["period_end_date"],
-        y=df_port["portfolio_eom"],
-        fill='tozeroy',
-        mode='lines',
-        name='Portfolio EOM NAV',
-        line_color='blue'
-    ))
-    fig_nav.update_layout(
-        title="Portfolio End-of-Month NAV Over Time",
-        xaxis_title="Period End Date",
-        yaxis_title="EOM NAV",
-        template="plotly_white"
-    )
-    st.plotly_chart(fig_nav, use_container_width=True)
-
-
-
-
-# ------------------------------------------------------------------------------
-# 9) STREAMLIT DASHBOARD
+# MAIN
 # ------------------------------------------------------------------------------
 def main():
-    # Set page config to wide mode, plus a custom title.
-    st.set_page_config(page_title="Investment Returns Dashboard", layout="wide")
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    logging.info("Loading asset performance data...")
+    perf_df = get_asset_performance_data()
 
-    st.title("Investment Returns Dashboard")
+    logging.info("Building instrument summary...")
+    summary_df = build_instrument_summary(perf_df)
 
-    # 1) Fetch monthly data for open instruments
-    st.subheader("1) Fetching Monthly Data for Open Instruments")
-    df_open = fetch_open_instrument_monthly_data()
-    if df_open.empty:
-        st.error("No open-instrument data found. Exiting.")
-        return
-    st.write("Monthly data for open instruments (snippet):")
-    st.dataframe(df_open.head(10))  # Show a snippet
+    summary_df["Latest NAV"] = summary_df["Latest NAV"].apply(lambda x: f"${x:,.2f}")
+    summary_df["Total Shares"] = summary_df["Total Shares"].apply(lambda x: f"{x:,.2f}")
 
-    # 2) Build instrument-level summary
-    st.subheader("2) Instrument-Level Returns Summary")
-    instr_summary_df = build_instrument_summary(df_open)
+    print("\nInstrument-Level Returns Summary:")
+    # Then immediately follow with:
+    print("""
+    Assumptions and Methodology:
+    - Returns are net of transaction costs, taxes, and fees.
+    - Sub-period returns are linked using the Modified Dietz method.
+    - Periods under 12 months are not annualized unless specified (marked as 'Ann.').
+    - Positions with insufficient return history are marked as 'SI' (Since Inception).
+    - Holdings are filtered by active positions (i.e., open lots only).
+    - All return figures reflect time-weighted performance at the position level.
+    """)
+    print_table_with_lines(summary_df)
+    benchmark_tickers = ["XLY", "EEM", "SPY", "QQQ", "XLK", "IXUS"]
+    benchmark_dfs = []
 
-    # 3) Fetch cost-based returns, merge into summary
-    cost_returns_df = fetch_cost_based_returns()
-    final_df = pd.merge(instr_summary_df, cost_returns_df, left_on="Instrument", right_on="instrument", how="left")
-    if "instrument" in final_df.columns:
-        final_df.drop(columns=["instrument"], inplace=True)
+    for ticker in benchmark_tickers:
+        logging.info(f"Loading benchmark data for {ticker}...")
+        df = get_benchmark_data(ticker)
+        logging.info(f"{ticker} data loaded: {df['price_date'].min().date()} to {df['price_date'].max().date()}")
+        
+        summary_df = build_benchmark_summary(df, name=ticker)
+        
+        for col in ["MTD", "QTD", "T3M", "YTD", "TTM", "T2Y", "T5Y"]:
+            summary_df[col] = summary_df[col].apply(lambda x: f"{x:.2%}" if pd.notnull(x) else "-")
+        
+        benchmark_dfs.append(summary_df)
 
-    # 4) Fetch portfolio-level data
-    df_portfolio = fetch_portfolio_monthly()
-    if not df_portfolio.empty:
-        st.subheader("Portfolio-Level Data Found")
-        # 4A) Build single-row summary for 'PORTFOLIO'
-        portfolio_row = build_portfolio_summary(df_portfolio)
-        final_df = pd.concat([final_df, portfolio_row], ignore_index=True)
+    full_benchmark_summary = pd.concat(benchmark_dfs, ignore_index=True)
 
-        # 4B) Place the portfolio row last
-        final_df["is_portfolio"] = (final_df["Instrument"] == "PORTFOLIO")
-        final_df.sort_values(["is_portfolio", "LTD"], ascending=[True, False], inplace=True)
-        final_df.drop(columns=["is_portfolio"], inplace=True)
-
-        # 4C) Show an area chart for EOM NAV
-        st.subheader("Portfolio EOM NAV Over Time")
-        plot_portfolio_nav_area(df_portfolio)
-
-    else:
-        st.info("No portfolio-level data found; skipping portfolio summary.")
-
-    # 5) Convert the final DataFrame to percentage columns & show a single table
-    st.subheader("3) Instrument + Portfolio Returns (Percentage)")
-    final_df_pct = format_as_percentage(final_df)
-    st.dataframe(final_df_pct)
-
-    # 6) (Optional) Quick Plotly chart example: TTM
-    st.subheader("4) Sample Plotly Chart (TTM Returns)")
-    fig = make_subplots(rows=1, cols=1, shared_xaxes=True)
-
-    def parse_percent_to_float(s):
-        if isinstance(s, str) and s.endswith("%"):
-            return float(s[:-1])
-        return None
-
-    ttm_values = final_df_pct["TTM"].apply(parse_percent_to_float)
-    fig.add_trace(go.Bar(
-        x=final_df_pct["Instrument"],
-        y=ttm_values,
-        name="TTM Return (%)",
-        marker_color="blue"
-    ))
-    fig.update_layout(
-        title="TTM Returns by Instrument",
-        template="plotly_white",
-        yaxis=dict(title="TTM (%)")
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
+    print("\nBenchmark Return Summary:")
+    print(full_benchmark_summary.to_string(index=False))
 
 if __name__ == "__main__":
     main()
-
-
-    # streamlit run "analytics/performance/investment_returns.py"

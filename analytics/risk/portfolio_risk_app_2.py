@@ -49,9 +49,8 @@ def get_open_positions():
         GROUP BY instrument
         ORDER BY instrument;
     """
-    conn = get_connection()
-    df = pd.read_sql(query, conn)
-    conn.close()
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn)
     return df
 
 # Fetch daily returns from market_data table
@@ -63,9 +62,8 @@ def fetch_daily_returns_db(symbol, start_date, end_date):
           AND price_date BETWEEN %s AND %s
         ORDER BY price_date;
     """
-    conn = get_connection()
-    df = pd.read_sql(query, conn, params=(symbol, start_date, end_date))
-    conn.close()
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn, params=(symbol, start_date, end_date))
 
     df.set_index('price_date', inplace=True)
     returns = df['close_price'].pct_change().dropna()
@@ -97,26 +95,76 @@ def fetch_current_price_db(symbol):
         ORDER BY price_date DESC
         LIMIT 1;
     """
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(query, (symbol,))
-    price = cur.fetchone()
-    conn.close()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (symbol,))
+            result = cur.fetchone()
+    return float(result[0]) if result else np.nan
 
-    return price[0] if price else np.nan
+def compute_daily_pnl_attribution(results_df, spy_returns, selected_date):
+    r_m_series = spy_returns.loc[spy_returns.index == selected_date]
+    if r_m_series.empty:
+        return pd.DataFrame()
+    r_m = r_m_series.values[0]
 
+    pnl_rows = []
+    for _, row in results_df.iterrows():
+        ticker = row['Ticker']
+        beta = row['Beta']
+        nmv = row['Net Mkt Value (USD)']
+
+        # Get today's return for this instrument
+        r_i_series = fetch_daily_returns_db(ticker, selected_date - timedelta(days=5), selected_date + timedelta(days=1))
+        if selected_date not in r_i_series:
+            continue
+        r_i = r_i_series.loc[selected_date]
+
+        # Attribution
+        market_component = beta * r_m * nmv
+        idio_component = (r_i - beta * r_m) * nmv
+        total_pnl = market_component + idio_component
+
+        pnl_rows.append({
+            'Ticker': ticker,
+            'Net Mkt Value (USD)': nmv,
+            'r_i': r_i,
+            'r_m': r_m,
+            'Beta': beta,
+            'Market PnL (USD)': market_component,
+            'Idio PnL (USD)': idio_component,
+            'Total PnL (USD)': total_pnl
+        })
+
+    return pd.DataFrame(pnl_rows)
 # Streamlit app
 def main():
-    st.set_page_config(page_title="Portfolio Risk Dashboard", layout="wide")
-    st.title("Portfolio Risk Dashboard")
+    st.set_page_config(page_title="Portfolio Volatility Dashboard", layout="wide")
+    st.title("Portfolio Volatility Dashboard")
+    st.markdown("Select a date to attribute daily PnL:")
+    selected_date = st.date_input(
+        "Attribution Date",
+        value=datetime.today().date() - timedelta(days=1),
+        max_value=datetime.today().date(),
+        help="PnL will be attributed as of this date."
+    )
 
     positions_df = get_open_positions()
     if positions_df.empty:
         st.error("No open positions found.")
         return
 
+    # --- Sidebar for Beta Lookback Window ---
+    lookback_options = {
+        "6 Months": 180,
+        "1 Year": 365,
+        "2 Years": 365 * 2,
+        "3 Years": 365 * 3
+    }
+    lookback_label = st.sidebar.selectbox("Select Lookback Window for Beta & Volatility", options=list(lookback_options.keys()), index=2)
+    lookback_days = lookback_options[lookback_label]
+
     end_date = datetime.today().date()
-    start_date = end_date - timedelta(days=365 * 2)
+    start_date = end_date - timedelta(days=lookback_days)
 
     spy_returns = fetch_daily_returns_db("SPY", start_date, end_date)
     if spy_returns.empty:
@@ -148,21 +196,40 @@ def main():
 
         results.append({
             'Ticker': instr,
+            'Current Price': curr_price,
             'Shares': shares,
             'Beta': beta,
             'Daily Idio Vol': daily_idio_vol,
-            'Current Price': curr_price,
             'Net Mkt Value (USD)': net_market_value,
             'Dollar Beta (USD)': dollar_beta,
             'Dollar Idio Vol (USD)': dollar_idio_vol
         })
 
     results_df = pd.DataFrame(results)
+    # --- Compute Daily PnL Attribution ---
+    pnl_df = compute_daily_pnl_attribution(results_df, spy_returns, selected_date)
+    if not pnl_df.empty:
+        st.subheader("Daily PnL Attribution (Market vs Idiosyncratic)")
+        st.dataframe(pnl_df.style.format({
+            'r_i': "{:.2%}",
+            'r_m': "{:.2%}",
+            'Market PnL (USD)': "${:,.2f}",
+            'Idio PnL (USD)': "${:,.2f}",
+            'Total PnL (USD)': "${:,.2f}"
+        }), use_container_width=True)
+
+        st.plotly_chart(
+            px.bar(pnl_df, x="Ticker", y=["Market PnL (USD)", "Idio PnL (USD)"],
+                barmode="stack", title="PnL Attribution by Ticker"),
+            use_container_width=True
+        )
+    else:
+        st.info("No PnL attribution available for today.")
     if results_df.empty:
         st.warning("No valid data available.")
         return
 
-    st.subheader("Instrument-Level Results")
+    st.subheader("Risk Decomposition")
     st.dataframe(results_df)
 
     portfolio_net_value = results_df['Net Mkt Value (USD)'].sum()
@@ -175,34 +242,28 @@ def main():
     annual_tracking_vol_usd = portfolio_idio_vol * np.sqrt(252)
     tracking_error_pct = (annual_tracking_vol_usd / portfolio_net_value) * 100 if portfolio_net_value else np.nan
 
-    summary_df = pd.DataFrame([{
-        "Net Portfolio Value ($)": portfolio_net_value,
-        "Total Dollar Beta ($)": portfolio_dollar_beta,
-        "Portfolio Beta (ratio)": portfolio_beta_decimal,
-        "Daily Market Vol (decimal)": market_vol,
-        "Market Component Vol ($)": portfolio_market_component_vol,
-        "Idio Variance ($^2)": portfolio_idio_var,
-        "Daily Idio Vol ($)": portfolio_idio_vol,
-        "Daily Portfolio Vol ($)": portfolio_total_vol,
-        "Annual Tracking Vol ($)": annual_tracking_vol_usd,
-        "Tracking Error (%)": tracking_error_pct
-    }]).T.reset_index()
-
-    summary_df.columns = ["Metric", "Value"]
+    summary_df = pd.DataFrame.from_dict({
+        "Net Portfolio Value ($)": [portfolio_net_value],
+        "Total Dollar Beta ($)": [portfolio_dollar_beta],
+        "Portfolio Beta (ratio)": [portfolio_beta_decimal],
+        "Daily Market Vol (decimal)": [market_vol],
+        "Market Component Vol ($)": [portfolio_market_component_vol],
+        "Idio Variance ($^2)": [portfolio_idio_var],
+        "Daily Idio Vol ($)": [portfolio_idio_vol],
+        "Daily Portfolio Vol ($)": [portfolio_total_vol],
+        "Annual Tracking Vol ($)": [annual_tracking_vol_usd],
+        "Tracking Error (%)": [tracking_error_pct]
+    }, orient='index', columns=['Value']).reset_index().rename(columns={'index': 'Metric'})
 
     st.subheader("Portfolio-Level Summary")
     st.dataframe(summary_df)
 
-    fig_nmv = px.bar(results_df, x="Ticker", y="Net Mkt Value (USD)", color="Ticker")
-    st.plotly_chart(fig_nmv, use_container_width=True)
-
-    fig_beta = px.bar(results_df, x="Ticker", y="Dollar Beta (USD)", color="Ticker")
-    st.plotly_chart(fig_beta, use_container_width=True)
+    st.plotly_chart(px.bar(results_df, x="Ticker", y="Net Mkt Value (USD)", color="Ticker"), use_container_width=True)
+    st.plotly_chart(px.bar(results_df, x="Ticker", y="Dollar Beta (USD)", color="Ticker"), use_container_width=True)
 
     st.success("Dashboard Updated.")
 
 if __name__ == "__main__":
     main()
 
-
-# streamlit run analytics/risk/portfolio_risk_app.py
+    # streamlit run analytics/risk/portfolio_risk_app_2.py
