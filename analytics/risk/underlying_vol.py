@@ -1,149 +1,142 @@
-import yfinance as yf
+#!/usr/bin/env python3
+
+import os
+import logging
+import psycopg2
 import pandas as pd
 import statsmodels.api as sm
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
-import logging
+from dotenv import load_dotenv
 
-# Configure logging (if not already configured in your project)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s'
-)
+# Load environment variables
+load_dotenv()
 
-def fetch_daily_returns(ticker: str, start_date: datetime, end_date: datetime) -> pd.Series:
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+
+# Database credentials
+DB_HOST = os.getenv('DB_HOST')
+DB_PORT = os.getenv('DB_PORT', 5432)
+DB_NAME = os.getenv('DB_NAME')
+DB_USER = os.getenv('DB_USER')
+DB_PASSWORD = os.getenv('DB_PASSWORD')
+
+# DB connection
+def get_connection():
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
+
+# Fetch open positions
+def get_open_positions():
+    query = """
+        SELECT DISTINCT instrument
+        FROM fifo_equity_lots
+        WHERE open_quantity > 0
+        ORDER BY instrument;
     """
-    Downloads adjusted daily close prices for the given ticker from Yahoo Finance
-    and returns a Series of daily percentage returns computed from the 'Close' column.
-    
-    Note:
-        With auto_adjust=True (the default), the 'Close' column returned by yfinance 
-        already reflects adjusted prices.
-    
-    Parameters:
-        ticker (str): The stock ticker symbol (e.g., "AAPL").
-        start_date (datetime): The start date for historical data.
-        end_date (datetime): The end date for historical data.
-    
-    Returns:
-        pd.Series: A series of daily percentage returns. If no data is returned,
-                   an empty series is returned.
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn)
+    return df["instrument"].tolist()
+
+# Fetch daily returns from market_data table
+def fetch_daily_returns_db(symbol: str, start_date: datetime, end_date: datetime) -> pd.Series:
+    query = """
+        SELECT price_date, close_price
+        FROM market_data
+        WHERE instrument = %s
+          AND price_date BETWEEN %s AND %s
+        ORDER BY price_date;
     """
-    try:
-        # Download historical data. auto_adjust is True by default.
-        df = yf.download(ticker, start=start_date, end=end_date)
-    except Exception as e:
-        logging.error("Error downloading data for %s: %s", ticker, e)
-        return pd.Series(dtype=float)
-    
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn, params=(symbol, start_date, end_date))
+
     if df.empty:
-        logging.warning("No price data returned for ticker: %s", ticker)
         return pd.Series(dtype=float)
-    
-    # Compute daily percentage returns using the adjusted 'Close' column
-    returns = df['Close'].pct_change().dropna()
+
+    df.set_index('price_date', inplace=True)
+    returns = df['close_price'].pct_change().dropna()
     return returns
 
-
+# Run regression and plot
 def run_regression_and_plot(df: pd.DataFrame, x_col: str, y_col: str,
-                            start_date: datetime, end_date: datetime) -> None:
-    """
-    Runs a linear OLS regression y = alpha + beta * x on the specified columns of df
-    and then plots the scatter and regression line in a minimalist style.
-    """
-    if df.empty or len(df) < 2:
-        print("[Error] Not enough data for regression.")
-        return
-
-    # Prepare regression variables
-    X = sm.add_constant(df[x_col])  # add a column of 1s (intercept)
+                            start_date: datetime, end_date: datetime,
+                            target_ticker: str) -> None:
+    X = sm.add_constant(df[x_col])
     y = df[y_col]
-
-    # Fit OLS model
     model = sm.OLS(y, X).fit()
+
     alpha = model.params['const']
     beta = model.params[x_col]
 
     print("\nRegression Results:")
     print(f"  Alpha (Intercept): {alpha:.6f}")
     print(f"  Beta (Slope):      {beta:.6f}")
-    print(model.summary())  # Optional: see more details
+    print(model.summary())
 
-    # ---- Minimalist / Dieter Rams–Inspired Plotting Style ----
-    plt.rcParams['figure.figsize'] = (8, 6)
-    plt.rcParams['figure.dpi'] = 100
-    plt.rcParams['axes.facecolor'] = '#fafafa'  # Light background
-    plt.rcParams['axes.edgecolor'] = '#333333'
-    plt.rcParams['axes.grid'] = True
-    plt.rcParams['grid.color'] = '#cccccc'
-    plt.rcParams['grid.linestyle'] = ':'
-    plt.rcParams['grid.alpha'] = 0.8
-    plt.rcParams['axes.spines.top'] = False
-    plt.rcParams['axes.spines.right'] = False
-    plt.rcParams['axes.spines.left'] = True
-    plt.rcParams['axes.spines.bottom'] = True
-    plt.rcParams['legend.frameon'] = False
-    plt.rcParams['font.size'] = 11
-    plt.rcParams['axes.titleweight'] = 'bold'
+    # Minimalist Plotting
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.scatter(df[x_col], df[y_col], color='steelblue', alpha=0.5, label='Daily Observations')
 
-    # Create figure & axis
-    fig, ax = plt.subplots()
-
-    # Scatter plot of the returns
-    ax.scatter(df[x_col], df[y_col],
-               color='steelblue', alpha=0.5,
-               label='Daily Observations')
-
-    # Regression line
     x_vals = np.linspace(df[x_col].min(), df[x_col].max(), 100)
     y_vals = alpha + beta * x_vals
-    ax.plot(x_vals, y_vals,
-            color='darkorange',
-            linewidth=2,
-            label='Regression Line')
+    ax.plot(x_vals, y_vals, color='darkorange', linewidth=2, label='Regression Line')
 
-    # Title / Axis Labels
-    title_str = (
-        f"Linear Regression of Toast (TOST) vs. SPY Daily Returns\n"
-        f"({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})"
-    )
-    ax.set_title(title_str, fontsize=12)
+    ax.set_title(f"{target_ticker} vs SPY Daily Returns\n({start_date.date()} to {end_date.date()})")
     ax.set_xlabel("SPY Daily Return")
-    ax.set_ylabel("TOST Daily Return")
-    ax.legend(loc='best')
-
+    ax.set_ylabel(f"{target_ticker} Daily Return")
+    ax.legend()
+    plt.tight_layout()
     plt.show()
 
-
+# Main logic
 def main():
-    # 1. Define our start and end dates for ~2 years
+    instruments = get_open_positions()
+    if not instruments:
+        print("No open positions found.")
+        return
+
+    print("\n📊 Available Open Positions:")
+    for idx, name in enumerate(instruments, start=1):
+        print(f"{idx}. {name}")
+
+    selection = input("\nEnter the number of the instrument to analyze: ")
+    try:
+        choice = int(selection)
+        assert 1 <= choice <= len(instruments)
+    except Exception:
+        print("Invalid selection.")
+        return
+
+    target_ticker = instruments[choice - 1]
+
     end_date = datetime.today()
     start_date = end_date - timedelta(days=365 * 2)
 
-    # 2. Fetch daily returns for TOST and SPY
-    tost_returns = fetch_daily_returns("TOST", start_date, end_date)
-    spy_returns = fetch_daily_returns("SPY", start_date, end_date)
+    r_target = fetch_daily_returns_db(target_ticker, start_date, end_date)
+    r_spy = fetch_daily_returns_db("SPY", start_date, end_date)
 
-    # 3. Merge into a single DataFrame
-    df = pd.concat([tost_returns, spy_returns], axis=1)
-    df.columns = ['R_TOST', 'R_SPY']
-    df = df.dropna()
-
-    # Quick check on data
-    print("Merged DataFrame (first 5 rows):")
-    print(df.head())
-    print(f"Total rows after merging: {len(df)}")
-
-    if len(df) < 2:
-        print("[Error] Not enough merged data for regression.")
+    if r_target.empty or r_spy.empty:
+        print("Missing data for selected instrument or SPY.")
         return
 
-    # 4. Run Regression (R_TOST = alpha + beta * R_SPY) and Plot
-    run_regression_and_plot(df, x_col='R_SPY', y_col='R_TOST',
-                            start_date=start_date, end_date=end_date)
+    df = pd.concat([r_target, r_spy], axis=1).dropna()
+    df.columns = ['R_TARGET', 'R_SPY']
 
+    if len(df) < 2:
+        print("Not enough overlapping data for regression.")
+        return
 
-# If running this file directly, execute main()
+    run_regression_and_plot(df, x_col='R_SPY', y_col='R_TARGET',
+                            start_date=start_date, end_date=end_date,
+                            target_ticker=target_ticker)
+
 if __name__ == "__main__":
     main()
