@@ -44,6 +44,19 @@ def get_asset_performance_data():
         df["period_end_date"] = pd.to_datetime(df["period_end_date"])
         return df
 
+def get_portfolio_performance_data():
+    query = """
+        SELECT *
+        FROM portfolio_performance_view
+        ORDER BY period_end_date
+    """
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn)
+        df["period_end_date"] = pd.to_datetime(df["period_end_date"])
+        return df
+    
+
+
 def get_current_position_start_from_lots(instrument: str) -> pd.Timestamp:
     query = """
         SELECT MIN(lot_open_date) AS start_date
@@ -115,8 +128,47 @@ def calculate_trailing_return_from_daily(df, months):
 
     return (end_price / start_price) - 1
 
+def calculate_trailing_return_for_portfolio(df, months, return_col="md_return_net"):
+    """
+    Calculates trailing time-weighted return for the portfolio over N months.
+    Assumes full continuous history (no position open filtering).
+    """
+    if df.empty:
+        return None, None
+
+    df = df.sort_values("period_end_date").copy()
+    max_date = df["period_end_date"].max()
+    cutoff = max_date - relativedelta(months=months)
+
+    subset = df[df["period_end_date"] > cutoff]
+    if subset.empty:
+        return None, None
+
+    raw_return = (1 + subset[return_col].fillna(0)).prod() - 1
+    actual_months = subset["period_end_date"].nunique()
+
+    if actual_months < months:
+        if actual_months >= 12:
+            ann_return = (1 + raw_return) ** (12 / actual_months) - 1
+            return ann_return, "Ann."
+        else:
+            return raw_return, "SI"
+
+    return raw_return, None
+
 def build_instrument_summary(df):
     summary = []
+
+    def fmt(val, flag):
+        if val is None:
+            return " " * 6 + "-"
+        pct_str = f"{val:>7.2%}"
+        if flag == "SI":
+            return f"{'SI':<6}{pct_str}"
+        elif flag == "Ann.":
+            return f"{'Ann.':<6}{pct_str}"
+        else:
+            return " " * 6 + pct_str
 
     for instrument, group in df.groupby("instrument"):
         group = group.sort_values("period_end_date").copy()
@@ -124,7 +176,6 @@ def build_instrument_summary(df):
             continue
 
         start_date = get_current_position_start_from_lots(instrument)
-        logging.info(f"{instrument}: Active position start = {start_date.date() if start_date else 'N/A'}")
         if start_date:
             group = group[group["period_end_date"] >= start_date]
         if group.empty:
@@ -138,17 +189,6 @@ def build_instrument_summary(df):
         t3m_val, t3m_flag = calculate_trailing_return(group, 3, instrument=instrument)
         ttm_val, ttm_flag = calculate_trailing_return(group, 12, instrument=instrument)
         t2y_val, t2y_flag = calculate_trailing_return(group, 24, instrument=instrument)
-
-        def fmt(val, flag):
-            if val is None:
-                return " " * 6 + "-"  # 6 spaces to match annotation space
-            pct_str = f"{val:>7.2%}"  # Right-align the percentage (7 total chars e.g. 123.45%)
-            if flag == "SI":
-                return f"{'SI':<6}{pct_str}"  # 'SI' left-aligned in 6-char field
-            elif flag == "Ann.":
-                return f"{'Ann.':<6}{pct_str}"
-            else:
-                return " " * 6 + pct_str
 
         summary.append({
             "instrument": instrument,
@@ -164,6 +204,49 @@ def build_instrument_summary(df):
         })
 
     return pd.DataFrame(summary)
+
+
+def build_portfolio_summary(portfolio_df):
+    def fmt(val, flag):
+        if val is None:
+            return " " * 6 + "-"
+        pct_str = f"{val:>7.2%}"
+        if flag == "SI":
+            return f"{'SI':<6}{pct_str}"
+        elif flag == "Ann.":
+            return f"{'Ann.':<6}{pct_str}"
+        else:
+            return " " * 6 + pct_str
+
+    portfolio_df = portfolio_df.sort_values("period_end_date")
+
+    latest = portfolio_df["period_end_date"].max()
+    mtd_start = latest.replace(day=1)
+    qtd_start = latest.replace(day=1) - relativedelta(months=(latest.month - 1) % 3)
+    ytd_start = latest.replace(month=1, day=1)
+
+    def calc_linked_return(subset):
+        if subset.empty:
+            return None
+        return (1 + subset["md_return_net"].fillna(0)).prod() - 1
+
+    t3m_val, t3m_flag = calculate_trailing_return_for_portfolio(portfolio_df, 3)
+    ttm_val, ttm_flag = calculate_trailing_return_for_portfolio(portfolio_df, 12)
+    t2y_val, t2y_flag = calculate_trailing_return_for_portfolio(portfolio_df, 24)
+
+    return {
+        "instrument": "Portfolio",
+        "MTD": fmt(calc_linked_return(portfolio_df[portfolio_df["period_end_date"] >= mtd_start]), None),
+        "QTD": fmt(calc_linked_return(portfolio_df[portfolio_df["period_end_date"] >= qtd_start]), None),
+        "T3M": fmt(t3m_val, t3m_flag),
+        "YTD": fmt(calc_linked_return(portfolio_df[portfolio_df["period_end_date"] >= ytd_start]), None),
+        "TTM": fmt(ttm_val, ttm_flag),
+        "T2Y": fmt(t2y_val, t2y_flag),
+        "LTD": fmt(calc_linked_return(portfolio_df), None),
+        "Latest NAV": portfolio_df["nav_eom"].iloc[-1],
+        "Total Shares": None
+    }
+
 
 def get_benchmark_data(benchmark="SPY"):
     query = """
@@ -217,7 +300,7 @@ def build_benchmark_summary(df, name="Benchmark"):
     ytd_start = latest.replace(month=1, day=1)
 
     return pd.DataFrame([{
-        "instrument": name,
+        "Benchmark": name,
         "MTD": calculate_trailing_return_from_daily(df[df["price_date"] >= mtd_start], 1),
         "QTD": calculate_trailing_return_from_daily(df[df["price_date"] >= qtd_start], 3),
         "T3M": calculate_trailing_return_from_daily(df, 3),
@@ -242,6 +325,7 @@ def print_table_with_lines(df):
         line = " | ".join([f"{str(val):<15}" for val in row])
         print(line)
 
+
 # ------------------------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------------------------
@@ -252,8 +336,8 @@ def main():
     logging.info("Building instrument summary...")
     summary_df = build_instrument_summary(perf_df)
 
-    summary_df["Latest NAV"] = summary_df["Latest NAV"].apply(lambda x: f"${x:,.2f}")
-    summary_df["Total Shares"] = summary_df["Total Shares"].apply(lambda x: f"{x:,.2f}")
+    summary_df["Latest NAV"] = summary_df["Latest NAV"].apply(lambda x: f"${x:,.2f}" if pd.notnull(x) else "-")
+    summary_df["Total Shares"] = summary_df["Total Shares"].apply(lambda x: f"{x:,.2f}" if pd.notnull(x) else "-")
 
     print("\nInstrument-Level Returns Summary:")
     # Then immediately follow with:
@@ -267,25 +351,47 @@ def main():
     - All return figures reflect time-weighted performance at the position level.
     """)
     print_table_with_lines(summary_df)
+
+    logging.info("Loading portfolio performance data...")
+    portfolio_df = get_portfolio_performance_data()
+
+    logging.info("Building portfolio summary...")
+    portfolio_summary = build_portfolio_summary(portfolio_df)
+
+    print("\nPortfolio-Level Returns Summary:")
+    print_table_with_lines(pd.DataFrame([portfolio_summary]))
+
+    portfolio_summary["Latest NAV"] = f"${portfolio_summary['Latest NAV']:,.2f}" if pd.notnull(portfolio_summary["Latest NAV"]) else "-"
+    portfolio_summary["Total Shares"] = f"{portfolio_summary['Total Shares']:,.2f}" if pd.notnull(portfolio_summary["Total Shares"]) else "-"
+    
     benchmark_tickers = ["XLY", "EEM", "SPY", "QQQ", "XLK", "IXUS"]
     benchmark_dfs = []
+
+    def fmt_benchmark(val):
+        if pd.isnull(val):
+            return "      -"
+        return f"{val:>7.2%}"
 
     for ticker in benchmark_tickers:
         logging.info(f"Loading benchmark data for {ticker}...")
         df = get_benchmark_data(ticker)
+        if df.empty:
+            logging.warning(f"No data found for {ticker}. Skipping.")
+            continue
+
         logging.info(f"{ticker} data loaded: {df['price_date'].min().date()} to {df['price_date'].max().date()}")
-        
         summary_df = build_benchmark_summary(df, name=ticker)
-        
+
         for col in ["MTD", "QTD", "T3M", "YTD", "TTM", "T2Y", "T5Y"]:
-            summary_df[col] = summary_df[col].apply(lambda x: f"{x:.2%}" if pd.notnull(x) else "-")
-        
+            summary_df[col] = summary_df[col].apply(fmt_benchmark)
+
+        summary_df = summary_df[["Benchmark", "MTD", "QTD", "T3M", "YTD", "TTM", "T2Y", "T5Y"]]
         benchmark_dfs.append(summary_df)
 
     full_benchmark_summary = pd.concat(benchmark_dfs, ignore_index=True)
 
     print("\nBenchmark Return Summary:")
-    print(full_benchmark_summary.to_string(index=False))
+    print_table_with_lines(full_benchmark_summary)
 
 if __name__ == "__main__":
     main()

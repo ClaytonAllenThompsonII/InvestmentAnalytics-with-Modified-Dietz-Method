@@ -10,8 +10,11 @@ import plotly.graph_objects as go
 import plotly.express as px
 from dotenv import load_dotenv
 from investment_returns import (
+    get_connection,
     get_asset_performance_data,
     build_instrument_summary,
+    get_portfolio_performance_data,
+    build_portfolio_summary,
     get_benchmark_data,
     build_benchmark_summary,
     get_current_position_start_from_lots
@@ -48,6 +51,13 @@ st.header("Instrument-Level Returns")
 with st.spinner("Loading instrument performance data..."):
     perf_df = get_asset_performance_data()
     summary_df = build_instrument_summary(perf_df)
+    # Add total/aggregate row
+    
+    numeric_cols = summary_df.select_dtypes(include=np.number).columns
+    # Add portfolio row using new summary logic
+    portfolio_df = get_portfolio_performance_data()
+    portfolio_row = build_portfolio_summary(portfolio_df)
+    summary_df = pd.concat([summary_df, pd.DataFrame([portfolio_row])], ignore_index=True)
 
 if not summary_df.empty:
     
