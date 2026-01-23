@@ -114,4 +114,4 @@ else:
     st.info("NAV data not available to plot portfolio chart.")
 
 # Run with:
-# streamlit run "analytics/performance/investment_returns_app.py"
+# streamlit run "src/investment_analytics/performance/investment_returns_app.py"
