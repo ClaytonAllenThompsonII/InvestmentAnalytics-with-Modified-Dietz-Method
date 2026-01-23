@@ -1,0 +1,48 @@
+/* === Typography === */
+h1, h2, h3, h4 {
+    font-family: 'Helvetica Neue', sans-serif;
+    font-weight: 500;
+    letter-spacing: 0.5px;
+}
+
+.stCaption {
+    font-size: 0.9rem;
+    color: #888;
+    margin-top: -10px;
+}
+
+/* === Sidebar Styling === */
+section[data-testid="stSidebar"] {
+    background-color: #f9f9f9;
+    padding: 1rem;
+    border-right: 1px solid #ddd;
+}
+
+.stButton > button {
+    width: 100%;
+    margin-top: 0.4rem;
+    border-radius: 8px;
+    background-color: #eaeaea;
+    color: #333;
+    border: 1px solid #ccc;
+    font-weight: 500;
+    padding: 0.55rem 1.1rem;
+    font-size: 0.92rem;
+    text-align: left;
+    transition: all 0.2s ease-in-out;
+}
+
+.stButton > button:hover {
+    background-color: #d5d5d5;
+    color: #111;
+    transform: translateX(2px);
+}
+
+/* === General Layout === */
+html, body {
+    background-color: #fff;
+}
+
+.stApp {
+    padding: 0;
+}
