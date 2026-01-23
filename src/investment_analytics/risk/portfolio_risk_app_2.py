@@ -266,4 +266,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-    # streamlit run analytics/risk/portfolio_risk_app_2.py
+    # streamlit run src/investment_analytics/risk/portfolio_risk_app_2.py

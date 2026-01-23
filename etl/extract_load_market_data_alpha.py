@@ -12,19 +12,37 @@ from collections import defaultdict
 # Load environment variables
 load_dotenv()
 
-# Required API key
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
+# --------------------------------------------------
+# Alpha Vantage API key selection (Premium → Free)
+# --------------------------------------------------
+ALPHAVANTAGE_API_KEY = (
+    os.getenv("ALPHAVANTAGE_PREMIUM_API_KEY")
+    or os.getenv("ALPHAVANTAGE_API_KEY")
+)
+
 if not ALPHAVANTAGE_API_KEY:
-    raise ValueError("Missing Alpha Vantage API key. Set ALPHAVANTAGE_API_KEY in .env")
+    raise ValueError(
+        "Missing Alpha Vantage API key. "
+        "Set ALPHAVANTAGE_API_KEY or ALPHAVANTAGE_PREMIUM_API_KEY in .env"
+    )
 
-# Alpha Vantage timeseries object
-ts = TimeSeries(key=ALPHAVANTAGE_API_KEY, output_format='json')
-
-# Set up logging
+# --------------------------------------------------
+# Logging configuration
+# --------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s'
+    format="%(asctime)s %(levelname)s: %(message)s"
 )
+
+if os.getenv("ALPHAVANTAGE_PREMIUM_API_KEY"):
+    logging.info("Using Alpha Vantage PREMIUM API key")
+else:
+    logging.info("Using Alpha Vantage FREE API key")
+
+# --------------------------------------------------
+# Alpha Vantage TimeSeries client
+# --------------------------------------------------
+ts = TimeSeries(key=ALPHAVANTAGE_API_KEY, output_format="json")
 
 # Environment-based DB credentials
 DB_HOST = os.getenv('DB_HOST')
@@ -88,7 +106,7 @@ def get_equity_symbols_to_pull():
 
 def get_active_option_positions():
     query = """
-        SELECT instrument, description, expiration_date, option_type, strike_price
+        SELECT instrument, description, open_date, expiration_date, option_type, strike_price
         FROM fifo_option_lots
         WHERE open_contracts > 0;
     """
@@ -244,76 +262,105 @@ def process_equity(symbol):
         upsert_market_data(records)
 
 
-def process_options(symbol, positions, date):
-    chain = fetch_alpha_options_chain(symbol, date)
-    if not chain:
-        return
+def process_options(symbol, positions):
+    today = datetime.now().date()
 
-    df = pd.DataFrame(chain)
-    if df.empty:
-        return
+    for owned in positions:
+        _, _, open_date, exp, typ, strike = owned
 
-    matched = []
-    for _, opt in df.iterrows():
-        for owned in positions:
-            _, _, exp, typ, strike = owned
-            if (
-                opt['expiration'] == exp.strftime('%Y-%m-%d') and
-                opt['type'].lower() == typ.lower() and
-                float(opt['strike']) == float(strike)
-            ):
-                matched.append((
-                    symbol,
-                    opt['contractID'],
-                    opt['expiration'],
-                    opt['strike'],
-                    opt['type'],
-                    opt['date'],
-                    opt.get('last'),
-                    opt.get('mark'),
-                    opt.get('bid'),
-                    opt.get('ask'),
-                    opt.get('volume'),
-                    opt.get('open_interest'),
-                    opt.get('implied_volatility'),
-                    opt.get('delta'),
-                    opt.get('gamma'),
-                    opt.get('theta'),
-                    opt.get('vega'),
-                    opt.get('rho')
-                ))
+        if not open_date:
+            logging.warning("Skipping contract with missing open_date: %s", owned)
+            continue
 
-    if matched:
-        upsert_options_market_data(matched)
+        date_range = pd.date_range(start=open_date, end=today, freq='B') # Business days only
 
+        for date in date_range:
+            date_str = date.strftime('%Y-%m-%d')
+            logging.info("Fetching %s %s @ %s for %s", typ, strike, exp.strftime('%Y-%m-%d'), date_str)
+
+            chain = fetch_alpha_options_chain(symbol, date_str)
+            if not chain:
+                continue
+
+            df = pd.DataFrame(chain)
+            if df.empty:
+                continue
+
+            for _, opt in df.iterrows():
+                try:
+                    if (
+                        opt['expiration'] == exp.strftime('%Y-%m-%d') and
+                        opt['type'].lower() == typ.lower() and
+                        float(opt['strike']) == float(strike)
+                    ):
+                        record = (
+                            symbol,
+                            opt['contractID'],
+                            opt['expiration'],
+                            opt['strike'],
+                            opt['type'],
+                            opt['date'],
+                            opt.get('last'),
+                            opt.get('mark'),
+                            opt.get('bid'),
+                            opt.get('ask'),
+                            opt.get('volume'),
+                            opt.get('open_interest'),
+                            opt.get('implied_volatility'),
+                            opt.get('delta'),
+                            opt.get('gamma'),
+                            opt.get('theta'),
+                            opt.get('vega'),
+                            opt.get('rho')
+                        )
+                        upsert_options_market_data([record])  # insert one day at a time
+                        break  # stop scanning this chain once matched
+                except Exception as e:
+                    logging.warning("Error matching contract on %s: %s", date_str, e)
 
 def main():
     logging.info("Starting ETL: Alpha Vantage equity and options load")
 
+    # NOTE: Truncating on every run + free-tier Alpha Vantage + outputsize='compact'
+    # can leave you with very little data if you hit rate limits or errors mid-run.
+    # If you want persistent accumulation, comment these out later.
     truncate_market_data()
     truncate_options_market_data()
 
-    # Equity processing
+    # -------------------------------
+    # EQUITY PROCESSING
+    # -------------------------------
     instruments = get_equity_symbols_to_pull()
     for instrument in instruments:
         symbol = SYMBOL_MAP.get(instrument, instrument)
         logging.info("Processing equity symbol: %s", symbol)
         process_equity(symbol)
 
-    # Options processing remains unchanged
-    option_positions = get_active_option_positions()
-    if not option_positions:
-        logging.info("No active option positions.")
-        return
+    # -------------------------------
+    # OPTIONS MARKET DATA (DISABLED)
+    # -------------------------------
+    logging.info(
+        "Options market data load skipped. "
+        "Alpha Vantage HISTORICAL_OPTIONS appears to be premium-only / restricted."
+    )
 
-    options_by_symbol = defaultdict(list)
-    for row in option_positions:
-        options_by_symbol[row[0]].append(row)
+    # NOTE:
+    # To re-enable later, uncomment the block below once you have Alpha Vantage premium
+    # access (or switch providers). Leaving code intact for future use.
+    #
+    # option_positions = get_active_option_positions()
+    # if not option_positions:
+    #     logging.info("No active option positions.")
+    #     return
+    #
+    # options_by_symbol = defaultdict(list)
+    # for row in option_positions:
+    #     options_by_symbol[row[0]].append(row)
+    #
+    # for symbol, positions in options_by_symbol.items():
+    #     logging.info("Processing options for: %s", symbol)
+    #     process_options(symbol, positions)
 
-    options_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')  # yesterday's date
-    for symbol, positions in options_by_symbol.items():
-        logging.info("Processing options for: %s", symbol)
-        process_options(symbol, positions, options_date)
 
 if __name__ == "__main__":
     main()

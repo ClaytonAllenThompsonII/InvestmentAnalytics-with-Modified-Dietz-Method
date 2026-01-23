@@ -9,7 +9,7 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 from dotenv import load_dotenv
-from investment_returns import (
+from investment_analytics.performance.investment_returns import (
     get_connection,
     get_asset_performance_data,
     build_instrument_summary,
@@ -38,6 +38,17 @@ def get_connection():
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD")
     )
+def get_market_data_as_of_date():
+    query = "SELECT MAX(price_date) AS as_of_date FROM market_data;"
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn)
+
+    as_of = df.loc[0, "as_of_date"]
+
+    if pd.isna(as_of):
+        return None
+
+    return pd.to_datetime(as_of).date()
 
 # Streamlit page config
 st.set_page_config(page_title="Investment Returns Dashboard", layout="wide")
@@ -51,6 +62,7 @@ st.header("Instrument-Level Returns")
 with st.spinner("Loading instrument performance data..."):
     perf_df = get_asset_performance_data()
     summary_df = build_instrument_summary(perf_df)
+    market_data_as_of = get_market_data_as_of_date()
     # Add total/aggregate row
     
     numeric_cols = summary_df.select_dtypes(include=np.number).columns
@@ -60,14 +72,22 @@ with st.spinner("Loading instrument performance data..."):
     summary_df = pd.concat([summary_df, pd.DataFrame([portfolio_row])], ignore_index=True)
 
 if not summary_df.empty:
-    
-    st.markdown("""
+
+    as_of_text = (
+        market_data_as_of.strftime("%m-%d-%Y")
+        if market_data_as_of
+        else "Unavailable"
+    )
+
+    st.markdown(f"""
     **Assumptions & Methodology:**
     - Returns are calculated using the **Modified Dietz Method** on a net basis (after fees, taxes, etc.).
     - Returns are linked monthly for compounding.
     - Trailing periods are annualized where appropriate and marked accordingly (`Ann.` for annualized, `SI` for since inception).
     - NAV figures reflect End-of-Month balances and are updated from actual holdings data.
+    - Market data is current as of **` {as_of_text} `**.
     """)
+    
     st.dataframe(summary_df, use_container_width=True)
 else:
     st.warning("No data available to display instrument-level summary.")
@@ -255,4 +275,4 @@ st.plotly_chart(px.bar(results_df, x="Ticker", y="Dollar Beta (USD)", color="Tic
 
 st.success("Dashboard Updated.")
 
-# streamlit run "analytics/performance/investment_returns_app2.py"
+# streamlit run "src/investment_analytics/performance/investment_returns_app2.py"

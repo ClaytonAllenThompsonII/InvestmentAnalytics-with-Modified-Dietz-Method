@@ -16,13 +16,17 @@ DB_PASSWORD = os.getenv('DB_PASSWORD')
 
 def get_connection():
     """Create a psycopg2 connection to the Postgres database."""
-    return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD
-    )
+    try:
+        return psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD
+        )
+    except Exception as e:
+        print("Error connecting to the database:", e)
+        raise
 
 
 def parse_parentheses(value_str):
@@ -227,8 +231,38 @@ def ingest_transactions(csv_file_path):
 
     print(f"Truncated 'transactions' and inserted {len(df)} rows from {csv_file_path}.")
 
+def run_post_ingestion_pipeline():
+    """
+    Runs the stored procedures in order after ingesting transactions.
+    """
+    steps = [
+        "load_options_transactions_enriched",
+        "process_option_fifo",
+        "process_equity_fifo"
+    ]
+
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                for sp in steps:
+                    print(f"Calling {sp}()...")
+                    cur.execute(f"CALL {sp}();")
+                    conn.commit()
+                    print(f"{sp} complete.")
+    except Exception as e:
+        print("Error running stored procedures:", e)
+        raise
+
 
 if __name__ == "__main__":
     # Robinhood CSV file for all transactions from direct investing account
     csv_path = "/Users/claytonthompson/Projects/InvestmentAnalytics/data/raw/robinhood/robinhood_transactions.csv"
+    # Step 1: Load CSV to raw transactions
     ingest_transactions(csv_path)
+    
+    # Step 2: Run modeling logic via stored procedures
+    run_post_ingestion_pipeline()
+    
+    print("ELT pipeline complete.")
+
+    # Make sure to delete automated Robinhood informational text at the bottom of a newly generated report. 
