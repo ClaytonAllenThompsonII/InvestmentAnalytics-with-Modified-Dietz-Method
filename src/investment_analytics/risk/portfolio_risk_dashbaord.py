@@ -9,7 +9,6 @@ import statsmodels.api as sm
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Tuple
-
 import matplotlib.pyplot as plt
 
 # -----------------------------------------------------------------------
@@ -90,7 +89,6 @@ def get_open_positions():
         if conn:
             conn.close()
 
-
 # -----------------------------------------------------------------------
 # 3. Market Data & Regression Helpers
 # -----------------------------------------------------------------------
@@ -141,6 +139,52 @@ def fetch_current_price_db(symbol: str) -> float:
             result = cur.fetchone()
     return float(result[0]) if result else np.nan
 
+
+def get_portfolio_performance_data():
+    """
+    Fetch monthly portfolio-level performance from the view `portfolio_performance_view`,
+    ordered by period_end_date.
+    """
+    query = """
+        SELECT *
+        FROM portfolio_performance_view
+        ORDER BY period_end_date
+    """
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn)
+        df["period_end_date"] = pd.to_datetime(df["period_end_date"])
+        return df
+
+def fetch_risk_free_rate():
+    query = """
+        SELECT yield_date, yield_percent
+        FROM treasury_yields
+        WHERE maturity = '3month' AND interval = 'monthly'
+        ORDER BY yield_date
+    """
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn)
+        df["yield_date"] = pd.to_datetime(df["yield_date"])
+        df["monthly_rf"] = df["yield_percent"] / 100 / 12
+        return df[["yield_date", "monthly_rf"]]
+    
+
+def calculate_sharpe_ratio(portfolio_returns_df: pd.DataFrame, rf_df: pd.DataFrame) -> float:
+    df = pd.merge(
+        portfolio_returns_df,
+        rf_df,
+        left_on="date",
+        right_on="yield_date",
+        how="inner"
+    )
+    df["excess_return"] = df["portfolio_return"] - df["monthly_rf"]
+
+    annualized_return = df["excess_return"].mean() * 12
+    annualized_vol = df["excess_return"].std() * np.sqrt(12)
+    
+    sharpe_ratio = annualized_return / annualized_vol if annualized_vol > 0 else np.nan
+    return round(sharpe_ratio, 2)
+
 # -----------------------------------------------------------------------
 # 4. Main Calculation Logic
 # -----------------------------------------------------------------------
@@ -169,7 +213,7 @@ def main():
 
     # B) Define date range for returns (2-year window)
     end_date = datetime.today()
-    start_date = end_date - timedelta(days=365*2)
+    start_date = end_date - timedelta(days=365*2) # changing from 365 x 2 for 2-year to 1 year for Sharpe.. 
 
     # C) Fetch SPY returns for reference (market)
     spy_returns = fetch_daily_returns_db("SPY", start_date, end_date)
@@ -243,6 +287,48 @@ def main():
     logging.info("Daily Tracking Vol (USD):           %.2f", portfolio_idio_vol)
     logging.info("Annual Tracking Vol (USD):          %.2f", annual_tracking_vol_usd)
     logging.info("Tracking Error (%% of NMV):          %.2f%%", tracking_error_pct)
+
+    # === SHARPE RATIO FROM MONTHLY PORTFOLIO RETURNS ===
+    portfolio_perf = get_portfolio_performance_data()
+    rf_df = fetch_risk_free_rate()
+
+    if portfolio_perf.empty or rf_df.empty:
+        logging.warning("Missing portfolio or treasury yield data for Sharpe ratio calc.")
+    else:
+        # Normalize treasury yield_date to end of month
+        rf_df["period_end_date"] = rf_df["yield_date"] + pd.offsets.MonthEnd(0)
+
+        df = pd.merge(
+            portfolio_perf,
+            rf_df,
+            on="period_end_date",
+            how="inner"
+        )
+        df["excess_return"] = df["md_return_net"] - df["monthly_rf"]
+
+        # Full History Sharpe
+        ann_return_full = df["excess_return"].mean() * 12
+        ann_vol_full    = df["excess_return"].std() * np.sqrt(12)
+        sharpe_full     = ann_return_full / ann_vol_full if ann_vol_full > 0 else np.nan
+
+        # Trailing 12-Month Sharpe
+        trailing_df = df.sort_values("period_end_date").tail(12)
+        ann_return_trailing = trailing_df["excess_return"].mean() * 12
+        ann_vol_trailing    = trailing_df["excess_return"].std() * np.sqrt(12)
+        sharpe_trailing     = ann_return_trailing / ann_vol_trailing if ann_vol_trailing > 0 else np.nan
+
+        logging.info("\n=== Sharpe Ratio Summary ===")
+        logging.info(">> Full History")
+        logging.info("Annualized Excess Return:          %.2f%%", ann_return_full * 100)
+        logging.info("Annualized Volatility:            %.2f%%", ann_vol_full * 100)
+        logging.info("Sharpe Ratio:                      %.2f", sharpe_full)
+
+        logging.info(">> Trailing 12-Months")
+        logging.info("Annualized Excess Return:          %.2f%%", ann_return_trailing * 100)
+        logging.info("Annualized Volatility:            %.2f%%", ann_vol_trailing * 100)
+        logging.info("Sharpe Ratio:                      %.2f", sharpe_trailing)
+
+    
 
     # Visualization
     results_df.sort_values('net_market_value', ascending=False, inplace=True)
