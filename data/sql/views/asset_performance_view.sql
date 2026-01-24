@@ -1,181 +1,187 @@
-CREATE OR REPLACE VIEW asset_performance_view AS
+-- ============================================================================
+-- patch_asset_performance_view_use_adjusted.sql
+-- Update asset_performance_view to source prices from market_data_daily_adjusted
+-- using adjusted_close (total-return series).
+-- ============================================================================
 
+CREATE OR REPLACE VIEW public.asset_performance_view AS
 WITH time_series_transactions AS (
     SELECT
         ts.instrument,
         ts.period_start_date,
         ts.period_end_date,
-        COALESCE(ea.total_buys, 0)         AS total_buys,
-        COALESCE(ea.total_sells, 0)        AS total_sells,
-        COALESCE(ea.total_splits, 0)       AS total_splits,
-        COALESCE(ea.net_cash_flow, 0)      AS net_cash_flow,
-        COALESCE(ea.weighted_cash_flow, 0) AS weighted_cash_flow,
-        COALESCE(ea.fees_and_taxes, 0)     AS fees_and_taxes
+        COALESCE(ea.total_buys, 0::numeric) AS total_buys,
+        COALESCE(ea.total_sells, 0::numeric) AS total_sells,
+        COALESCE(ea.total_splits, 0::numeric) AS total_splits,
+        COALESCE(ea.net_cash_flow, 0::numeric) AS net_cash_flow,
+        COALESCE(ea.weighted_cash_flow, 0::double precision) AS weighted_cash_flow,
+        COALESCE(ea.fees_and_taxes, 0::numeric) AS fees_and_taxes
     FROM time_series ts
     LEFT JOIN enriched_transactions_agg ea
-        ON  ts.instrument = ea.instrument
-        AND ts.period_start_date = ea.period_start_date
-        AND ts.period_end_date   = ea.period_end_date
+      ON ts.instrument::text = ea.instrument::text
+     AND ts.period_start_date = ea.period_start_date
+     AND ts.period_end_date   = ea.period_end_date
 ),
-
-.
 prices AS (
     SELECT
         md.instrument,
-        DATE_TRUNC('month', md.price_date) AS price_month,
-        FIRST_VALUE(md.close_price) OVER (
-            PARTITION BY md.instrument, DATE_TRUNC('month', md.price_date)
+        date_trunc('month', md.price_date::timestamp with time zone) AS price_month,
+
+        first_value(COALESCE(md.adjusted_close, md.close_price)) OVER (
+            PARTITION BY md.instrument, date_trunc('month', md.price_date::timestamp with time zone)
             ORDER BY md.price_date
         ) AS bom_price_raw,
-        LAST_VALUE(md.close_price) OVER (
-            PARTITION BY md.instrument, DATE_TRUNC('month', md.price_date)
+
+        last_value(COALESCE(md.adjusted_close, md.close_price)) OVER (
+            PARTITION BY md.instrument, date_trunc('month', md.price_date::timestamp with time zone)
             ORDER BY md.price_date
             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
         ) AS eom_price_raw,
+
         md.price_date
-    FROM market_data md
+    FROM market_data_daily_adjusted md
 ),
 merged_data AS (
     SELECT DISTINCT ON (tst.instrument, tst.period_start_date)
-        tst.*,
+        tst.instrument,
+        tst.period_start_date,
+        tst.period_end_date,
+        tst.total_buys,
+        tst.total_sells,
+        tst.total_splits,
+        tst.net_cash_flow,
+        tst.weighted_cash_flow,
+        tst.fees_and_taxes,
         p.bom_price_raw,
         p.eom_price_raw,
         COALESCE(
-            LAG(p.eom_price_raw) OVER (PARTITION BY tst.instrument ORDER BY tst.period_start_date),
+            lag(p.eom_price_raw) OVER (PARTITION BY tst.instrument ORDER BY tst.period_start_date),
             p.bom_price_raw
         ) AS bom_price,
         p.eom_price_raw AS eom_price
     FROM time_series_transactions tst
     LEFT JOIN prices p
-        ON  tst.instrument = p.instrument
-        AND tst.period_start_date = p.price_month
+      ON tst.instrument::text = p.instrument::text
+     AND tst.period_start_date = p.price_month
     ORDER BY tst.instrument, tst.period_start_date, p.price_date
 ),
 cumulative_shares AS (
     SELECT
-        md.*,
-        SUM(
-            md.total_buys 
-            - md.total_sells
-            + md.total_splits
-        ) OVER (
-            PARTITION BY md.instrument
-            ORDER BY md.period_start_date
-        ) AS eom_shares_cumulative
+        md.instrument,
+        md.period_start_date,
+        md.period_end_date,
+        md.total_buys,
+        md.total_sells,
+        md.total_splits,
+        md.net_cash_flow,
+        md.weighted_cash_flow,
+        md.fees_and_taxes,
+        md.bom_price_raw,
+        md.eom_price_raw,
+        md.bom_price,
+        md.eom_price,
+        sum(md.total_buys - md.total_sells + md.total_splits)
+          OVER (PARTITION BY md.instrument ORDER BY md.period_start_date) AS eom_shares_cumulative
     FROM merged_data md
 ),
 final_data AS (
     SELECT
-        cs.*,
+        cs.instrument,
+        cs.period_start_date,
+        cs.period_end_date,
+        cs.total_buys,
+        cs.total_sells,
+        cs.total_splits,
+        cs.net_cash_flow,
+        cs.weighted_cash_flow,
+        cs.fees_and_taxes,
+        cs.bom_price_raw,
+        cs.eom_price_raw,
+        cs.bom_price,
+        cs.eom_price,
+        cs.eom_shares_cumulative,
         COALESCE(
-            LAG(cs.eom_shares_cumulative) OVER (PARTITION BY cs.instrument ORDER BY cs.period_start_date),
-            0
+            lag(cs.eom_shares_cumulative) OVER (PARTITION BY cs.instrument ORDER BY cs.period_start_date),
+            0::numeric
         ) AS bom_shares_cumulative
     FROM cumulative_shares cs
 )
 SELECT
-    fd.instrument,
-    fd.period_start_date,
-    fd.period_end_date,
+    instrument,
+    period_start_date,
+    period_end_date,
+    total_buys,
+    total_sells,
+    total_splits,
+    bom_shares_cumulative,
+    eom_shares_cumulative,
+    bom_price,
+    eom_price,
+    bom_shares_cumulative * bom_price AS nav_bom,
+    eom_shares_cumulative * eom_price AS nav_eom,
+    net_cash_flow,
+    weighted_cash_flow,
+    fees_and_taxes,
+    eom_shares_cumulative * eom_price - bom_shares_cumulative * bom_price - net_cash_flow + fees_and_taxes AS pnl_gross,
+    eom_shares_cumulative * eom_price - bom_shares_cumulative * bom_price - net_cash_flow AS pnl_net,
 
-    -- Share flow
-    fd.total_buys,
-    fd.total_sells,
-    fd.total_splits,
-
-    -- Share positions
-    fd.bom_shares_cumulative,
-    fd.eom_shares_cumulative,
-
-    -- Prices
-    fd.bom_price,
-    fd.eom_price,
-
-    -- NAVs
-    fd.bom_shares_cumulative * fd.bom_price AS nav_bom,
-    fd.eom_shares_cumulative * fd.eom_price AS nav_eom,
-
-    -- Cash flows
-    fd.net_cash_flow,
-    fd.weighted_cash_flow,
-    fd.fees_and_taxes,
-
-    -- PNL Gross
-    (fd.eom_shares_cumulative * fd.eom_price)
-    - (fd.bom_shares_cumulative * fd.bom_price)
-    - fd.net_cash_flow
-    + fd.fees_and_taxes
-    AS pnl_gross,
-
-    -- PNL Net
-    (fd.eom_shares_cumulative * fd.eom_price)
-    - (fd.bom_shares_cumulative * fd.bom_price)
-    - fd.net_cash_flow
-    AS pnl_net,
-
-    -- Average Capital for Modified Dietz (Gross)
     CASE
-        WHEN fd.bom_shares_cumulative = 0 AND fd.eom_shares_cumulative > 0 THEN fd.net_cash_flow
-        WHEN fd.bom_shares_cumulative > 0 AND fd.eom_shares_cumulative = 0 THEN ABS(fd.net_cash_flow)
-        ELSE COALESCE(fd.bom_shares_cumulative * fd.bom_price, 0) + fd.weighted_cash_flow
+        WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN net_cash_flow::double precision
+        WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow)::double precision
+        ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision + weighted_cash_flow
     END AS avg_capital_gross,
 
-    -- Average Capital for Modified Dietz (Net)
     CASE
-        WHEN fd.bom_shares_cumulative = 0 AND fd.eom_shares_cumulative > 0 THEN fd.net_cash_flow - fd.fees_and_taxes
-        WHEN fd.bom_shares_cumulative > 0 AND fd.eom_shares_cumulative = 0 THEN ABS(fd.net_cash_flow - fd.fees_and_taxes)
-        ELSE COALESCE(fd.bom_shares_cumulative * fd.bom_price, 0) + (fd.weighted_cash_flow - fd.fees_and_taxes)
+        WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN (net_cash_flow - fees_and_taxes)::double precision
+        WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow - fees_and_taxes)::double precision
+        ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision
+             + (weighted_cash_flow - fees_and_taxes::double precision)
     END AS avg_capital_net,
 
-    -- Modified Dietz Return (Gross)
     CASE
         WHEN (
             CASE
-                WHEN fd.bom_shares_cumulative = 0 AND fd.eom_shares_cumulative > 0 THEN fd.net_cash_flow
-                WHEN fd.bom_shares_cumulative > 0 AND fd.eom_shares_cumulative = 0 THEN ABS(fd.net_cash_flow)
-                ELSE COALESCE(fd.bom_shares_cumulative * fd.bom_price, 0) + fd.weighted_cash_flow
+                WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN net_cash_flow::double precision
+                WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow)::double precision
+                ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision + weighted_cash_flow
             END
-        ) != 0 THEN
-            ROUND(
-                (
-                    (fd.eom_shares_cumulative * fd.eom_price) - (fd.bom_shares_cumulative * fd.bom_price) - fd.net_cash_flow
-                ) /
-                (
-                    CASE
-                        WHEN fd.bom_shares_cumulative = 0 AND fd.eom_shares_cumulative > 0 THEN fd.net_cash_flow
-                        WHEN fd.bom_shares_cumulative > 0 AND fd.eom_shares_cumulative = 0 THEN ABS(fd.net_cash_flow)
-                        ELSE COALESCE(fd.bom_shares_cumulative * fd.bom_price, 0) + fd.weighted_cash_flow
-                    END
-                )::numeric,
-                6
-            )
-        ELSE NULL
+        ) <> 0::double precision
+        THEN round(
+            (eom_shares_cumulative * eom_price - bom_shares_cumulative * bom_price - net_cash_flow) /
+            (
+                CASE
+                    WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN net_cash_flow::double precision
+                    WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow)::double precision
+                    ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision + weighted_cash_flow
+                END
+            )::numeric,
+            6
+        )
+        ELSE NULL::numeric
     END AS md_return_gross,
 
-    -- Modified Dietz Return (Net)
     CASE
         WHEN (
             CASE
-                WHEN fd.bom_shares_cumulative = 0 AND fd.eom_shares_cumulative > 0 THEN fd.net_cash_flow - fd.fees_and_taxes
-                WHEN fd.bom_shares_cumulative > 0 AND fd.eom_shares_cumulative = 0 THEN ABS(fd.net_cash_flow - fd.fees_and_taxes)
-                ELSE COALESCE(fd.bom_shares_cumulative * fd.bom_price, 0) + (fd.weighted_cash_flow - fd.fees_and_taxes)
+                WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN (net_cash_flow - fees_and_taxes)::double precision
+                WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow - fees_and_taxes)::double precision
+                ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision
+                     + (weighted_cash_flow - fees_and_taxes::double precision)
             END
-        ) != 0 THEN
-            ROUND(
-                (
-                    (fd.eom_shares_cumulative * fd.eom_price) - (fd.bom_shares_cumulative * fd.bom_price) - (fd.net_cash_flow - fd.fees_and_taxes)
-                ) /
-                (
-                    CASE
-                        WHEN fd.bom_shares_cumulative = 0 AND fd.eom_shares_cumulative > 0 THEN fd.net_cash_flow - fd.fees_and_taxes
-                        WHEN fd.bom_shares_cumulative > 0 AND fd.eom_shares_cumulative = 0 THEN ABS(fd.net_cash_flow - fd.fees_and_taxes)
-                        ELSE COALESCE(fd.bom_shares_cumulative * fd.bom_price, 0) + (fd.weighted_cash_flow - fd.fees_and_taxes)
-                    END
-                )::numeric,
-                6
-            )
-        ELSE NULL
+        ) <> 0::double precision
+        THEN round(
+            (eom_shares_cumulative * eom_price - bom_shares_cumulative * bom_price - (net_cash_flow - fees_and_taxes)) /
+            (
+                CASE
+                    WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN (net_cash_flow - fees_and_taxes)::double precision
+                    WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow - fees_and_taxes)::double precision
+                    ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision
+                         + (weighted_cash_flow - fees_and_taxes::double precision)
+                END
+            )::numeric,
+            6
+        )
+        ELSE NULL::numeric
     END AS md_return_net
-
-FROM final_data fd
-ORDER BY fd.instrument, fd.period_start_date;
+FROM final_data
+ORDER BY instrument, period_start_date;

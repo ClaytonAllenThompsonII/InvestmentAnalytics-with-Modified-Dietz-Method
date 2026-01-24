@@ -31,8 +31,10 @@ def get_connection():
     )
 
 # ------------------------------------------------------------------------------
-# CORE FUNCTIONS
+# DATA ACCESS (READS)
 # ------------------------------------------------------------------------------
+# Purpose: pull raw / modeled datasets from Postgres for downstream analytics.
+
 def get_asset_performance_data():
     query = """
         SELECT *
@@ -54,8 +56,21 @@ def get_portfolio_performance_data():
         df = pd.read_sql(query, conn)
         df["period_end_date"] = pd.to_datetime(df["period_end_date"])
         return df
-    
 
+def get_benchmark_data(benchmark="SPY"):
+    query = """
+        SELECT
+            price_date,
+            COALESCE(adjusted_close, close_price) AS adj_price
+        FROM market_data_daily_adjusted
+        WHERE instrument = %s
+          AND price_date >= CURRENT_DATE - INTERVAL '60 months'
+        ORDER BY price_date
+    """
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn, params=(benchmark,))
+    df["price_date"] = pd.to_datetime(df["price_date"])
+    return df
 
 def get_current_position_start_from_lots(instrument: str) -> pd.Timestamp:
     query = """
@@ -69,12 +84,54 @@ def get_current_position_start_from_lots(instrument: str) -> pd.Timestamp:
             return None
         return pd.to_datetime(df.iloc[0]["start_date"])
 
+
+# ==============================================================================
+# ## --- RETURN MATH (CORE CALCULATIONS)
+# ==============================================================================
+# Purpose: pure-ish functions that compute returns from a provided dataframe.
+# Note: keep these free of DB calls where possible (easier to test).
+
 def calculate_twr_from_monthly(df, return_col="md_return_net"):
+    """
+    Chain-link monthly Modified Dietz returns to produce a time-weighted return.
+
+    This reflects the standard institutional approach: returns are
+    time-weighted across months via geometric linking, while each
+    monthly sub-period return is money-weighted (Modified Dietz)
+    within the period.
+    """
     if df.empty:
         return None
     return (1 + df[return_col].fillna(0)).prod() - 1
 
+def simple_return(df, price_col="adj_price"):
+    """
+    Compute a simple total return over a period using adjusted prices.
+
+    Intended for benchmark analysis (e.g., SPY, QQQ), where dividends and
+    corporate actions are assumed to be continuously reinvested. Using
+    adjusted prices produces a total return series without explicitly
+    modeling cash flows, fees, or timing effects, consistent with
+    institutional benchmark practice.
+    """
+    if df is None or df.empty or len(df) < 2:
+        return None
+    df = df.sort_values("price_date")
+    start_price = df[price_col].iloc[0]
+    end_price = df[price_col].iloc[-1]
+    if pd.isna(start_price) or pd.isna(end_price) or start_price == 0:
+        return None
+    return (end_price / start_price) - 1
+
 def calculate_trailing_return(df, months, return_col="md_return_net", instrument=None):
+    """
+    Compute a trailing chain-linked return over the last N months.
+
+    Uses monthly Modified Dietz returns (money-weighted within each month)
+    and chain-links them across months (time-weighted across periods).
+    If `instrument` is provided, the window is also clipped to the current
+    open-position start date; short histories are labeled as SI or Ann.
+    """
     if df.empty:
         return None, None
 
@@ -108,30 +165,15 @@ def calculate_trailing_return(df, months, return_col="md_return_net", instrument
 
     return raw_return, None
 
-def calculate_trailing_return_from_daily(df, months):
-    if df.empty:
-        return None
-
-    df = df.sort_values("price_date").copy()
-    latest_date = df["price_date"].max()
-    cutoff_date = latest_date - relativedelta(months=months)
-
-    subset = df[df["price_date"] >= cutoff_date]
-    if subset.empty or len(subset) < 2:
-        return None
-
-    start_price = subset["close_price"].iloc[0]
-    end_price = subset["close_price"].iloc[-1]
-
-    if start_price == 0 or pd.isna(start_price) or pd.isna(end_price):
-        return None
-
-    return (end_price / start_price) - 1
-
 def calculate_trailing_return_for_portfolio(df, months, return_col="md_return_net"):
     """
-    Calculates trailing time-weighted return for the portfolio over N months.
-    Assumes full continuous history (no position open filtering).
+    Compute a trailing portfolio return over the last N months via chain-linking.
+
+    Assumes the portfolio return series is already aggregated at the portfolio
+    level per month (e.g., portfolio_performance_view md_return_net). Returns are
+    geometrically linked across months (time-weighted across periods), while each
+    monthly sub-period return is a Modified Dietz return (money-weighted within
+    the month). No position start-date filtering is applied.
     """
     if df.empty:
         return None, None
@@ -155,6 +197,33 @@ def calculate_trailing_return_for_portfolio(df, months, return_col="md_return_ne
             return raw_return, "SI"
 
     return raw_return, None
+
+def calculate_trailing_return_from_daily(df, months, price_col="adj_price"):
+    """
+    Calculate a trailing total return over N months using daily price data.
+
+    This function is designed primarily for benchmarks, not active portfolios.
+    It computes a simple start-to-end total return over the trailing window
+    using adjusted prices, implicitly assuming dividend reinvestment and no
+    cash-flow timing effects. Unlike the Modified Dietz approach, this method
+    does not account for intra-period cash flows and is therefore appropriate
+    for passive index comparisons rather than manager performance attribution.
+    """
+    if df is None or df.empty:
+        return None
+
+    df = df.sort_values("price_date").copy()
+    latest_date = df["price_date"].max()
+    cutoff_date = latest_date - relativedelta(months=months)
+
+    subset = df[df["price_date"] >= cutoff_date]
+    return simple_return(subset, price_col=price_col)
+
+
+# ==============================================================================
+# ## --- SUMMARY BUILDERS (PRESENTATION LAYER)
+# ==============================================================================
+# Purpose: take canonical datasets + compute formatted outputs for tables/UI.
 
 def build_instrument_summary(df):
     summary = []
@@ -248,50 +317,6 @@ def build_portfolio_summary(portfolio_df):
     }
 
 
-def get_benchmark_data(benchmark="SPY"):
-    query = """
-        SELECT price_date, close_price
-        FROM market_data
-        WHERE instrument = %s
-        AND price_date >= CURRENT_DATE - INTERVAL '60 months'
-        ORDER BY price_date
-    """
-    with get_connection() as conn:
-        df = pd.read_sql(query, conn, params=(benchmark,))
-        df["price_date"] = pd.to_datetime(df["price_date"])
-        return df
-
-    if df.empty:
-        return None, None
-
-    start_date = None
-    if instrument:
-        start_date = get_current_position_start_from_lots(instrument)
-        if start_date:
-            df = df[df["period_end_date"] >= start_date]
-        if df.empty:
-            return None, None
-
-    max_date = df["period_end_date"].max()
-    cutoff = max_date - relativedelta(months=months)
-
-    subset = df[df["period_end_date"] > cutoff]
-    if subset.empty:
-        return None, None
-
-    raw_return = calculate_twr_from_monthly(subset, return_col)
-
-    # ✅ Key fix: If position was opened AFTER the trailing window, it's SI
-    if start_date and start_date > cutoff:
-        return raw_return, "SI"
-
-    # ✅ Optional: if months >= 12 and data is sparse, annualize
-    if months >= 12 and subset["period_end_date"].nunique() < months:
-        annualized = (1 + raw_return) ** (12 / subset["period_end_date"].nunique()) - 1
-        return annualized, "Ann."
-
-    return raw_return, None
-
 def build_benchmark_summary(df, name="Benchmark"):
     df = df.sort_values("price_date")
     latest = df["price_date"].max()
@@ -301,14 +326,19 @@ def build_benchmark_summary(df, name="Benchmark"):
 
     return pd.DataFrame([{
         "Benchmark": name,
-        "MTD": calculate_trailing_return_from_daily(df[df["price_date"] >= mtd_start], 1),
-        "QTD": calculate_trailing_return_from_daily(df[df["price_date"] >= qtd_start], 3),
+        "MTD": simple_return(df[df["price_date"] >= mtd_start]),
+        "QTD": simple_return(df[df["price_date"] >= qtd_start]),
         "T3M": calculate_trailing_return_from_daily(df, 3),
-        "YTD": calculate_trailing_return_from_daily(df[df["price_date"] >= ytd_start], 6),
+        "YTD": simple_return(df[df["price_date"] >= ytd_start]),
         "TTM": calculate_trailing_return_from_daily(df, 12),
         "T2Y": calculate_trailing_return_from_daily(df, 24),
-        "T5Y": calculate_trailing_return_from_daily(df, 60)
+        "T5Y": calculate_trailing_return_from_daily(df, 60),
     }])
+
+#==============================================================================
+# ## --- CLI / PRINT HELPERS
+# ==============================================================================
+# Purpose: terminal formatting helpers (not used by Streamlit, but useful for debug).
 
 def print_table_with_lines(df):
     col_names = df.columns.tolist()
@@ -327,7 +357,7 @@ def print_table_with_lines(df):
 
 
 # ------------------------------------------------------------------------------
-# MAIN
+# MAIN (SCRIPT ENTRYPOINT)
 # ------------------------------------------------------------------------------
 def main():
     logging.info("Loading asset performance data...")

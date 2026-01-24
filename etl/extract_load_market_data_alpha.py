@@ -8,6 +8,7 @@ from psycopg2.extras import execute_values
 from alpha_vantage.timeseries import TimeSeries
 import requests
 from collections import defaultdict
+from typing import Optional
 
 # Load environment variables
 load_dotenv()
@@ -42,7 +43,7 @@ else:
 # --------------------------------------------------
 # Alpha Vantage TimeSeries client
 # --------------------------------------------------
-ts = TimeSeries(key=ALPHAVANTAGE_API_KEY, output_format="json")
+#ts = TimeSeries(key=ALPHAVANTAGE_API_KEY, output_format="json")
 
 # Environment-based DB credentials
 DB_HOST = os.getenv('DB_HOST')
@@ -53,8 +54,15 @@ DB_PASSWORD = os.getenv('DB_PASSWORD')
 
 # Symbol remapping and validation constants
 SYMBOL_MAP = {'FB': 'META'}
-REQUIRED_EQUITY_COLS = ['price_date', 'open_price', 'high_price', 'low_price', 'close_price']
-
+REQUIRED_EQUITY_COLS = [
+    "price_date",
+    "open_price", "high_price", "low_price", "close_price",
+    "adjusted_close",
+    "volume",
+    "dividend_amount",
+    "split_coefficient",
+    "last_refreshed_date",
+]
 
 def get_connection():
     return psycopg2.connect(
@@ -69,7 +77,7 @@ def get_connection():
 def truncate_market_data():
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("TRUNCATE TABLE market_data RESTART IDENTITY;")
+            cursor.execute("TRUNCATE TABLE market_data_daily_adjusted RESTART IDENTITY;")
         conn.commit()
     logging.info("Truncated market_data table. Starting fresh...")
 
@@ -117,50 +125,96 @@ def get_active_option_positions():
 
 
 
-def fetch_alpha_data_for_instrument(symbol):
+def fetch_alpha_data_for_instrument(symbol: str) -> Optional[pd.DataFrame]:
+    url = (
+        "https://www.alphavantage.co/query"
+        f"?function=TIME_SERIES_DAILY_ADJUSTED"
+        f"&symbol={symbol}"
+        f"&outputsize=full"
+        f"&apikey={ALPHAVANTAGE_API_KEY}"
+    )
+
     try:
-        data, _ = ts.get_daily(symbol=symbol, outputsize='full')
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
     except Exception as e:
-        logging.error("Alpha Vantage error for %s: %s", symbol, e)
+        logging.error("Request error for %s: %s", symbol, e)
         return None
 
-    if not data:
-        logging.warning("No data returned for %s", symbol)
+    # Alpha Vantage errors / throttling
+    if "Error Message" in payload:
+        logging.error("Alpha Vantage error for %s: %s", symbol, payload["Error Message"])
+        return None
+    if "Note" in payload:
+        raise RuntimeError(f"Alpha Vantage throttling: {payload['Note']}")
+
+    meta = payload.get("Meta Data", {})
+    ts_daily = payload.get("Time Series (Daily)", {})
+
+    if not ts_daily:
+        logging.warning("No Time Series (Daily) returned for %s", symbol)
         return None
 
-    try:
-        df = pd.DataFrame.from_dict(data, orient='index')
-        df.index = pd.to_datetime(df.index)
-        df.columns = [
-            'open_price', 'high_price', 'low_price',
-            'close_price', 'volume'
+    last_refreshed = meta.get("3. Last Refreshed")
+    last_refreshed_date = pd.to_datetime(last_refreshed).date() if last_refreshed else None
+
+    df = pd.DataFrame.from_dict(ts_daily, orient="index")
+    df.index = pd.to_datetime(df.index)
+    df.sort_index(inplace=True)
+
+    # Map Alpha Vantage numbered fields → clean column names
+    rename_map = {
+        "1. open": "open_price",
+        "2. high": "high_price",
+        "3. low": "low_price",
+        "4. close": "close_price",
+        "5. adjusted close": "adjusted_close",
+        "6. volume": "volume",
+        "7. dividend amount": "dividend_amount",
+        "8. split coefficient": "split_coefficient",
+    }
+    df.rename(columns=rename_map, inplace=True)
+
+    # Ensure expected columns exist (some can be missing if payload changes)
+    for col in rename_map.values():
+        if col not in df.columns:
+            df[col] = None
+
+    # Cast numerics safely
+    numeric_cols = [
+        "open_price", "high_price", "low_price",
+        "close_price", "adjusted_close",
+        "dividend_amount", "split_coefficient",
+    ]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("Int64")
+
+    df["price_date"] = df.index.date
+    df["last_refreshed_date"] = last_refreshed_date
+
+    return df[
+        [
+            "price_date",
+            "open_price", "high_price", "low_price", "close_price",
+            "adjusted_close",
+            "volume",
+            "dividend_amount",
+            "split_coefficient",
+            "last_refreshed_date",
         ]
-        df.sort_index(inplace=True)
-
-        if df.empty:
-            logging.info("No data available for %s after retrieval.", symbol)
-            return None
-
-        # Just add the date from the index directly
-        df['price_date'] = df.index.date
-
-        # Keep daily frequency by removing the monthly grouping entirely
-        df['currency'] = None
-        df['exchange'] = None
-
-        return df[[
-            'price_date', 'open_price', 'high_price',
-            'low_price', 'close_price', 'volume', 'currency', 'exchange'
-        ]]
-    except Exception as e:
-        logging.error("Processing error for %s: %s", symbol, e)
-        return None
+    ]
     
 def upsert_market_data(records):
     sql = """
-        INSERT INTO market_data (
-            instrument, price_date, open_price, high_price, low_price,
-            close_price, volume, currency, exchange
+        INSERT INTO market_data_daily_adjusted (
+            instrument, price_date,
+            open_price, high_price, low_price, close_price,
+            adjusted_close, volume,
+            dividend_amount, split_coefficient,
+            last_refreshed_date
         )
         VALUES %s
         ON CONFLICT (instrument, price_date)
@@ -169,15 +223,17 @@ def upsert_market_data(records):
             high_price = EXCLUDED.high_price,
             low_price = EXCLUDED.low_price,
             close_price = EXCLUDED.close_price,
+            adjusted_close = EXCLUDED.adjusted_close,
             volume = EXCLUDED.volume,
-            currency = EXCLUDED.currency,
-            exchange = EXCLUDED.exchange;
+            dividend_amount = EXCLUDED.dividend_amount,
+            split_coefficient = EXCLUDED.split_coefficient,
+            last_refreshed_date = EXCLUDED.last_refreshed_date;
     """
     with get_connection() as conn:
         with conn.cursor() as cursor:
             execute_values(cursor, sql, records)
         conn.commit()
-    logging.info("Upserted %d equity records.", len(records))
+    logging.info("Upserted %d daily adjusted equity records.", len(records))
 
 
 
@@ -238,9 +294,10 @@ def process_equity(symbol):
     records = []
     for _, row in df.iterrows():
         try:
-            missing = [col for col in REQUIRED_EQUITY_COLS if col not in row or pd.isna(row[col])]
+            required_non_null = ["price_date", "close_price", "adjusted_close"]
+            missing = [c for c in required_non_null if pd.isna(row.get(c))]
             if missing:
-                raise ValueError(f"Missing columns: {missing}")
+                raise ValueError(f"Missing required values: {missing}")
 
             volume_val = int(row['volume']) if pd.notna(row['volume']) else None
 
@@ -251,9 +308,11 @@ def process_equity(symbol):
                 row['high_price'],
                 row['low_price'],
                 row['close_price'],
-                volume_val,
-                row['currency'],
-                row['exchange']
+                row['adjusted_close'],
+                int(row['volume']) if pd.notna(row['volume']) else None,
+                row['dividend_amount'],
+                row['split_coefficient'],
+                row['last_refreshed_date'],
             ))
         except Exception as e:
             logging.warning("Skipping row for %s due to error: %s", symbol, e)

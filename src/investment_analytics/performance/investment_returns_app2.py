@@ -39,7 +39,7 @@ def get_connection():
         password=os.getenv("DB_PASSWORD")
     )
 def get_market_data_as_of_date():
-    query = "SELECT MAX(price_date) AS as_of_date FROM market_data;"
+    query = "SELECT MAX(price_date) AS as_of_date FROM market_data_daily_adjusted;"
     with get_connection() as conn:
         df = pd.read_sql(query, conn)
 
@@ -65,7 +65,7 @@ with st.spinner("Loading instrument performance data..."):
     market_data_as_of = get_market_data_as_of_date()
     # Add total/aggregate row
     
-    numeric_cols = summary_df.select_dtypes(include=np.number).columns
+    #numeric_cols = summary_df.select_dtypes(include=np.number).columns
     # Add portfolio row using new summary logic
     portfolio_df = get_portfolio_performance_data()
     portfolio_row = build_portfolio_summary(portfolio_df)
@@ -181,18 +181,18 @@ def get_open_positions():
 
 def fetch_daily_returns_db(symbol, start_date, end_date):
     query = """
-        SELECT price_date, close_price FROM market_data
+        SELECT price_date, adjusted_close FROM market_data_daily_adjusted
         WHERE instrument = %s AND price_date BETWEEN %s AND %s
         ORDER BY price_date;
     """
     with get_connection() as conn:
         df = pd.read_sql(query, conn, params=(symbol, start_date, end_date))
     df.set_index('price_date', inplace=True)
-    return df['close_price'].pct_change().dropna()
+    return df['adjusted_close'].pct_change().dropna()
 
 def fetch_current_price_db(symbol):
     query = """
-        SELECT close_price FROM market_data
+        SELECT adjusted_close FROM market_data_daily_adjusted
         WHERE instrument = %s ORDER BY price_date DESC LIMIT 1;
     """
     with get_connection() as conn:
