@@ -91,6 +91,19 @@ def get_current_position_start_from_lots(instrument: str) -> pd.Timestamp:
 # Purpose: pure-ish functions that compute returns from a provided dataframe.
 # Note: keep these free of DB calls where possible (easier to test).
 
+# ------------------------------------------------------------------------------
+# Portfolio & Position Returns (Monthly, Modified Dietz)
+# ------------------------------------------------------------------------------
+# Scope:
+#   - Active portfolio and instrument-level performance
+#   - Monthly Modified Dietz returns (money-weighted within period)
+#   - Geometrically-linked across months (time-weighted across periods)
+#
+# Notes:
+#   - Used for portfolio, position, and attribution reporting
+#   - All trailing returns are evaluated as-of month-end
+#   - Position start dates may clip trailing windows
+
 def calculate_twr_from_monthly(df, return_col="md_return_net"):
     """
     Chain-link monthly Modified Dietz returns to produce a time-weighted return.
@@ -103,25 +116,6 @@ def calculate_twr_from_monthly(df, return_col="md_return_net"):
     if df.empty:
         return None
     return (1 + df[return_col].fillna(0)).prod() - 1
-
-def simple_return(df, price_col="adj_price"):
-    """
-    Compute a simple total return over a period using adjusted prices.
-
-    Intended for benchmark analysis (e.g., SPY, QQQ), where dividends and
-    corporate actions are assumed to be continuously reinvested. Using
-    adjusted prices produces a total return series without explicitly
-    modeling cash flows, fees, or timing effects, consistent with
-    institutional benchmark practice.
-    """
-    if df is None or df.empty or len(df) < 2:
-        return None
-    df = df.sort_values("price_date")
-    start_price = df[price_col].iloc[0]
-    end_price = df[price_col].iloc[-1]
-    if pd.isna(start_price) or pd.isna(end_price) or start_price == 0:
-        return None
-    return (end_price / start_price) - 1
 
 def calculate_trailing_return(df, months, return_col="md_return_net", instrument=None):
     """
@@ -198,27 +192,65 @@ def calculate_trailing_return_for_portfolio(df, months, return_col="md_return_ne
 
     return raw_return, None
 
-def calculate_trailing_return_from_daily(df, months, price_col="adj_price"):
-    """
-    Calculate a trailing total return over N months using daily price data.
 
-    This function is designed primarily for benchmarks, not active portfolios.
-    It computes a simple start-to-end total return over the trailing window
-    using adjusted prices, implicitly assuming dividend reinvestment and no
-    cash-flow timing effects. Unlike the Modified Dietz approach, this method
-    does not account for intra-period cash flows and is therefore appropriate
-    for passive index comparisons rather than manager performance attribution.
+# ------------------------------------------------------------------------------
+# Benchmark Returns (Passive, Month-End Total Return)
+# ------------------------------------------------------------------------------
+# Scope:
+#   - Passive benchmark indices (e.g., SPY, QQQ, XLK)
+#   - Total return approximated via adjusted prices
+#   - Daily prices are snapped to month-end before return calculation
+#
+# Notes:
+#   - Benchmarks are evaluated on the same month-end schedule as portfolio returns
+#   - No cash-flow timing or Modified Dietz logic applies
+#   - Intended for relative performance comparison, not attribution
+
+def benchmark_monthly_returns(df_daily: pd.DataFrame, price_col: str = "adj_price") -> pd.DataFrame:
     """
-    if df is None or df.empty:
+    Convert daily benchmark prices into a month-end series of monthly total returns.
+
+    - Snaps to the last available trading day in each month (month-end proxy).
+    - Uses adjusted prices so monthly returns approximate total return (dividend reinvestment).
+    """
+    if df_daily is None or df_daily.empty:
+        return pd.DataFrame(columns=["period_end_date", "monthly_return"])
+
+    df = df_daily.sort_values("price_date").copy()
+
+    # Month bucket
+    df["month"] = df["price_date"].dt.to_period("M").dt.to_timestamp()
+
+    # Last trading day price per month
+    eom = (
+        df.groupby("month", as_index=False)
+          .agg(period_end_date=("price_date", "max"),
+               eom_price=(price_col, "last"))
+          .sort_values("period_end_date")
+    )
+
+    # Monthly total return (needs previous month-end)
+    eom["monthly_return"] = eom["eom_price"].pct_change()
+
+    # Drop the first month (no prior month to compute return)
+    eom = eom.dropna(subset=["monthly_return"])
+
+    return eom[["period_end_date", "monthly_return"]]
+
+def calculate_trailing_return_benchmark_eom(df_daily, months, price_col="adj_price"):
+    """
+    Trailing benchmark return over N months, anchored to latest completed month-end.
+
+    Uses month-end snapped monthly total returns (from adjusted prices) and chain-links them.
+    """
+    monthly = benchmark_monthly_returns(df_daily, price_col=price_col)
+    if monthly.empty:
         return None
 
-    df = df.sort_values("price_date").copy()
-    latest_date = df["price_date"].max()
-    cutoff_date = latest_date - relativedelta(months=months)
-
-    subset = df[df["price_date"] >= cutoff_date]
-    return simple_return(subset, price_col=price_col)
-
+    # Reuse your chain-link helper (expects a return column)
+    cutoff = monthly["period_end_date"].max() - relativedelta(months=months)
+    subset = monthly[monthly["period_end_date"] > cutoff]
+    return calculate_twr_from_monthly(subset, return_col="monthly_return")
 
 # ==============================================================================
 # ## --- SUMMARY BUILDERS (PRESENTATION LAYER)
@@ -316,23 +348,53 @@ def build_portfolio_summary(portfolio_df):
         "Total Shares": None
     }
 
+# ------------------------------------------------------------------------------
+# Benchmark Return Summary (Month-End, Total Return Proxy)
+# ------------------------------------------------------------------------------
+# Purpose:
+#   - Produce benchmark returns on the same month-end grid as portfolio performance
+#   - Support like-for-like relative performance comparison in reporting tables
 
-def build_benchmark_summary(df, name="Benchmark"):
-    df = df.sort_values("price_date")
-    latest = df["price_date"].max()
-    mtd_start = latest.replace(day=1)
-    qtd_start = latest.replace(day=1) - pd.DateOffset(months=(latest.month - 1) % 3)
-    ytd_start = latest.replace(month=1, day=1)
+def build_benchmark_summary(df_daily, name="Benchmark"):
+    """
+    Build a benchmark return summary aligned to month-end reporting.
+
+    Benchmarks are treated as passive total-return series using adjusted prices,
+    then aggregated to month-end and chain-linked across months for trailing periods.
+    """
+    # Convert daily adjusted prices → month-end monthly return series
+    monthly = benchmark_monthly_returns(df_daily, price_col="adj_price")
+    if monthly.empty:
+        return pd.DataFrame([{
+            "Benchmark": name,
+            "MTD": None, "QTD": None, "T3M": None, "YTD": None, "TTM": None, "T2Y": None, "T5Y": None
+        }])
+
+    # As-of date = latest month-end available in the monthly series
+    asof = monthly["period_end_date"].max()
+
+    # Period starts (month-end anchored)
+    mtd_start = asof.replace(day=1)
+    qtd_start = asof.replace(day=1) - relativedelta(months=(asof.month - 1) % 3)
+    ytd_start = asof.replace(month=1, day=1)
+
+    # Helper: chain-link monthly returns over a subset
+    def linked(sub):
+        if sub is None or sub.empty:
+            return None
+        return calculate_twr_from_monthly(sub, return_col="monthly_return")
 
     return pd.DataFrame([{
         "Benchmark": name,
-        "MTD": simple_return(df[df["price_date"] >= mtd_start]),
-        "QTD": simple_return(df[df["price_date"] >= qtd_start]),
-        "T3M": calculate_trailing_return_from_daily(df, 3),
-        "YTD": simple_return(df[df["price_date"] >= ytd_start]),
-        "TTM": calculate_trailing_return_from_daily(df, 12),
-        "T2Y": calculate_trailing_return_from_daily(df, 24),
-        "T5Y": calculate_trailing_return_from_daily(df, 60),
+        # “MTD/QTD/YTD” here means “since period start through latest month-end”
+        "MTD": linked(monthly[monthly["period_end_date"] >= mtd_start]),
+        "QTD": linked(monthly[monthly["period_end_date"] >= qtd_start]),
+        "YTD": linked(monthly[monthly["period_end_date"] >= ytd_start]),
+        # Trailing horizons (chain-linked month-end series)
+        "T3M": calculate_trailing_return_benchmark_eom(df_daily, 3, price_col="adj_price"),
+        "TTM": calculate_trailing_return_benchmark_eom(df_daily, 12, price_col="adj_price"),
+        "T2Y": calculate_trailing_return_benchmark_eom(df_daily, 24, price_col="adj_price"),
+        "T5Y": calculate_trailing_return_benchmark_eom(df_daily, 60, price_col="adj_price"),
     }])
 
 #==============================================================================
