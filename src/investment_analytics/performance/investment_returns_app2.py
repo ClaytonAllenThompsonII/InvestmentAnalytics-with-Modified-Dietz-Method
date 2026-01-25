@@ -38,6 +38,7 @@ def get_connection():
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD")
     )
+
 def get_market_data_as_of_date():
     query = "SELECT MAX(price_date) AS as_of_date FROM market_data_daily_adjusted;"
     with get_connection() as conn:
