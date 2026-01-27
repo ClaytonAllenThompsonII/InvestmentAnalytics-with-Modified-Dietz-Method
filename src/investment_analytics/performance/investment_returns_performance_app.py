@@ -97,6 +97,7 @@ html, body, [class*="css"] {
 """, unsafe_allow_html=True)
 
 performance_as_of = get_performance_as_of_date()
+perf_as_of_pretty = performance_as_of.strftime("%B %d, %Y") if performance_as_of else "Unavailable"
 daily_mkt_as_of = get_market_data_as_of_date_daily()
 
 perf_as_of_text = performance_as_of.strftime("%m-%d-%Y") if performance_as_of else "Unavailable"
@@ -177,11 +178,12 @@ else:
 
     st.dataframe(instrument_summary_df, use_container_width=True)
 
-    st.markdown("""
+    st.markdown(f"""
     <div class="perf-footnote">
     <p>Returns methodology: money-weighted (Modified Dietz) within each month; time-weighted via geometric linking across periods.</p>
-    <p>Labels: <code>SI</code> = since inception; <code>Ann.</code> = annualized.</p>
+    <p>SI = since inception; Ann. = annualized.</p>
     <p>Net Asset Value (NAV) reflects end-of-month balances from the performance model.</p>
+    <p>As-of date: {perf_as_of_pretty}. All reported returns are evaluated using the latest completed month-end.</p>
     </div>
     """, unsafe_allow_html=True)
 
