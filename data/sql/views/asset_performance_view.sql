@@ -105,8 +105,8 @@ final_data AS (
             0::numeric
         ) AS bom_shares_cumulative
     FROM cumulative_shares cs
-)
-SELECT
+),
+calc AS (SELECT
     instrument,
     period_start_date,
     period_end_date,
@@ -122,66 +122,64 @@ SELECT
     net_cash_flow,
     weighted_cash_flow,
     fees_and_taxes,
-    eom_shares_cumulative * eom_price - bom_shares_cumulative * bom_price - net_cash_flow + fees_and_taxes AS pnl_gross,
+    -- PnL definitions:
+    --   gross: treat dividend taxes/ADR fees as NOT paid (add them back via cash flow)
+    --   net:   actual investor experience (dividend minus withholding/fees)
+    eom_shares_cumulative * eom_price - bom_shares_cumulative * bom_price - net_cash_flow - fees_and_taxes AS pnl_gross, -- fees, tax are negative flows, and subtracting them calculates the gross amount, which are already included in net. 
     eom_shares_cumulative * eom_price - bom_shares_cumulative * bom_price - net_cash_flow AS pnl_net,
 
+        -- Average Capital (single denominator for both gross & net returns)
     CASE
-        WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN net_cash_flow::double precision
-        WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow)::double precision
-        ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision + weighted_cash_flow
-    END AS avg_capital_gross,
+        -- Position initiated during the month (BOM = 0, EOM > 0)
+        WHEN bom_shares_cumulative = 0::numeric
+            AND eom_shares_cumulative > 0::numeric
+        THEN net_cash_flow::double precision
 
-    CASE
-        WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN (net_cash_flow - fees_and_taxes)::double precision
-        WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow - fees_and_taxes)::double precision
+        -- Position fully exited during the month (BOM > 0, EOM = 0)
+        WHEN bom_shares_cumulative > 0::numeric
+            AND eom_shares_cumulative = 0::numeric
+        THEN abs(net_cash_flow)::double precision
+
+        -- Normal case: capital at risk = BOM NAV + time-weighted cash flows
         ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision
-             + (weighted_cash_flow - fees_and_taxes::double precision)
-    END AS avg_capital_net,
+            + weighted_cash_flow
+    END AS avg_capital
+    FROM final_data
+)
 
+SELECT
+    instrument,
+    period_start_date,
+    period_end_date,
+    total_buys,
+    total_sells,
+    total_splits,
+    bom_shares_cumulative,
+    eom_shares_cumulative,
+    bom_price,
+    eom_price,
+    nav_bom,
+    nav_eom,
+    net_cash_flow,
+    weighted_cash_flow,
+    fees_and_taxes,
+    pnl_gross,
+    pnl_net,
+    avg_capital,
+
+    -- Modified Dietz return (gross)
     CASE
-        WHEN (
-            CASE
-                WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN net_cash_flow::double precision
-                WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow)::double precision
-                ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision + weighted_cash_flow
-            END
-        ) <> 0::double precision
-        THEN round(
-            (eom_shares_cumulative * eom_price - bom_shares_cumulative * bom_price - net_cash_flow) /
-            (
-                CASE
-                    WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN net_cash_flow::double precision
-                    WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow)::double precision
-                    ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision + weighted_cash_flow
-                END
-            )::numeric,
-            6
-        )
+        WHEN avg_capital <> 0::double precision
+        THEN ROUND((pnl_gross / avg_capital)::numeric, 6)
         ELSE NULL::numeric
     END AS md_return_gross,
 
+    -- Modified Dietz return (net)
     CASE
-        WHEN (
-            CASE
-                WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN (net_cash_flow - fees_and_taxes)::double precision
-                WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow - fees_and_taxes)::double precision
-                ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision
-                     + (weighted_cash_flow - fees_and_taxes::double precision)
-            END
-        ) <> 0::double precision
-        THEN round(
-            (eom_shares_cumulative * eom_price - bom_shares_cumulative * bom_price - (net_cash_flow - fees_and_taxes)) /
-            (
-                CASE
-                    WHEN bom_shares_cumulative = 0::numeric AND eom_shares_cumulative > 0::numeric THEN (net_cash_flow - fees_and_taxes)::double precision
-                    WHEN bom_shares_cumulative > 0::numeric AND eom_shares_cumulative = 0::numeric THEN abs(net_cash_flow - fees_and_taxes)::double precision
-                    ELSE COALESCE(bom_shares_cumulative * bom_price, 0::numeric)::double precision
-                         + (weighted_cash_flow - fees_and_taxes::double precision)
-                END
-            )::numeric,
-            6
-        )
+        WHEN avg_capital <> 0::double precision
+        THEN ROUND((pnl_net / avg_capital)::numeric, 6)
         ELSE NULL::numeric
     END AS md_return_net
-FROM final_data
+
+FROM calc
 ORDER BY instrument, period_start_date;
