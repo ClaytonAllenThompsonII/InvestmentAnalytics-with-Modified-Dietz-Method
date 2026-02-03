@@ -202,7 +202,22 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-    st.dataframe(instrument_summary_df, use_container_width=True)
+    # Keep the column numeric (do NOT convert to strings)
+    df = instrument_summary_df.copy()
+
+    styler = (
+        df.style
+        .format({
+            "Latest NAV": lambda x: "—" if pd.isna(x) else f"{x:,.0f}",
+            "Total Shares": lambda x: "—" if pd.isna(x) else f"{x:,.0f}",
+        })
+        .set_properties(
+            subset=["Latest NAV", "Total Shares"],
+            **{"text-align": "right"}
+        )
+    )
+
+    st.dataframe(styler, use_container_width=True)
 
     st.markdown(f"""
     <div class="perf-footnote">
