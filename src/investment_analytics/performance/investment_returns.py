@@ -1,16 +1,31 @@
 #!/usr/bin/env python3
+"""
+investment_returns.py
+
+Core performance utilities for:
+- Reading monthly performance model outputs (Postgres views)
+- Computing linked returns (Modified Dietz monthly -> time-weighted across months)
+- Building instrument/portfolio/benchmark summaries for Streamlit + CLI
+- Building instrument time-series (line series) for charts (SI + rolling windows)
+
+Terminology:
+- "line series" / "time series" = values over time (what we plot)
+- "curve" reserved for fitted functions (not used here)
+"""
 
 import os
 import logging
 import psycopg2
 from dotenv import load_dotenv
 import pandas as pd
+import numpy as np
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
-# ------------------------------------------------------------------------------
-# LOAD ENV + SETUP LOGGING
-# ------------------------------------------------------------------------------
+
+# ==============================================================================
+# 0) LOAD ENV + LOGGING
+# ==============================================================================
 load_dotenv()
 
 logging.basicConfig(
@@ -19,7 +34,7 @@ logging.basicConfig(
 )
 
 # ------------------------------------------------------------------------------
-# DATABASE CONNECTION
+# 1) DATABASE CONNECTION
 # ------------------------------------------------------------------------------
 def get_connection():
     return psycopg2.connect(
@@ -30,9 +45,9 @@ def get_connection():
         password=os.getenv("DB_PASSWORD")
     )
 
-# ------------------------------------------------------------------------------
-# DATA ACCESS (READS)
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# 2) DATA ACCESS (READS) — Postgres -> pandas
+# ==============================================================================
 # Purpose: pull raw / modeled datasets from Postgres for downstream analytics.
 
 def get_asset_performance_data():
@@ -86,9 +101,9 @@ def get_current_position_start_from_lots(instrument: str) -> pd.Timestamp:
 
 
 # ==============================================================================
-# ## --- RETURN MATH (CORE CALCULATIONS)
+# 3) RETURN MATH — core compounding utilities
 # ==============================================================================
-# Purpose: pure-ish functions that compute returns from a provided dataframe.
+# Purpose: compute returns from a provided dataframe/series.
 # Note: keep these free of DB calls where possible (easier to test).
 
 # ------------------------------------------------------------------------------
@@ -193,9 +208,80 @@ def calculate_trailing_return_for_portfolio(df, months, return_col="md_return_ne
     return raw_return, None
 
 
-# ------------------------------------------------------------------------------
-# Benchmark Returns (Passive, Month-End Total Return)
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# 4) MONTHLY LINE-SERIES BUILDERS — canonical inputs to charting
+# ==============================================================================
+# Purpose: build instrument time series (line series) for charts:
+# - SI cumulative return line series
+# - rolling trailing return line series (12M/24M/36M/60M)
+
+def get_instrument_monthly_returns(
+    perf_df: pd.DataFrame,
+    instrument: str,
+    return_col: str = "md_return_net",
+    ) -> pd.DataFrame:
+    """
+    Instrument monthly return time series (one row per month-end).
+
+    Output columns:
+      - period_end_date (Timestamp)
+      - monthly_return (float)
+    """
+    df = perf_df.loc[perf_df["instrument"] == instrument, ["period_end_date", return_col]].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["period_end_date", "monthly_return"])
+
+    df = df.sort_values("period_end_date")
+    df = df.rename(columns={return_col: "monthly_return"})
+    df["period_end_date"] = pd.to_datetime(df["period_end_date"])
+    df["monthly_return"] = pd.to_numeric(df["monthly_return"], errors="coerce")
+    return df.reset_index(drop=True)
+
+def add_cumulative_return_si_log(monthly_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a Since Inception (SI) cumulative return line series over time.
+
+    Uses log-compounding for numerical stability:
+      SI_t = exp( sum_{0..t} log(1 + r_t) ) - 1
+    """
+    df = monthly_df.copy()
+    if df.empty:
+        df["si_return"] = pd.Series(dtype="float64")
+        return df
+
+    log_1p = np.log1p(df["monthly_return"].fillna(0).astype(float))
+    df["si_return"] = np.expm1(log_1p.cumsum())  # exp(cumsum) - 1
+    return df
+
+def add_rolling_trailing_returns_log(
+    monthly_df: pd.DataFrame,
+    windows=(12, 24, 36, 60),
+) -> pd.DataFrame:
+    """
+    Add trailing rolling return line series over time for each window k months.
+
+    Trailing return at time t:
+      T{k}M_t = exp( sum_{t-k+1..t} log(1+r_t) ) - 1
+
+    Notes:
+    - First k-1 rows are NaN (insufficient history). Expected behavior.
+    """
+    df = monthly_df.copy()
+    if df.empty:
+        for k in windows:
+            df[f"t{k}m_return"] = pd.Series(dtype="float64")
+        return df
+
+    log_1p = np.log1p(df["monthly_return"].fillna(0).astype(float))
+    for k in windows:
+        df[f"t{k}m_return"] = np.expm1(log_1p.rolling(k).sum())
+
+    return df
+
+
+# ==============================================================================
+# 5) BENCHMARK RETURNS — month-end snapped passive series
+# ==============================================================================
 # Scope:
 #   - Passive benchmark indices (e.g., SPY, QQQ, XLK)
 #   - Total return approximated via adjusted prices
@@ -253,11 +339,23 @@ def calculate_trailing_return_benchmark_eom(df_daily, months, price_col="adj_pri
     return calculate_twr_from_monthly(subset, return_col="monthly_return")
 
 # ==============================================================================
-# ## --- SUMMARY BUILDERS (PRESENTATION LAYER)
+# ## --- PRESENTATION BUILDERS (TABLES & PLOTS)
 # ==============================================================================
-# Purpose: take canonical datasets + compute formatted outputs for tables/UI.
+# Purpose:
+#   - Transform canonical return series into presentation-ready structures
+#   - Produce *tidy* DataFrames for tables and charts
+#   - No database access; no business logic; no return math
+#
+# Scope:
+#   - Summary tables (instrument, portfolio, benchmark)
+#   - Plot-ready long-form time series (e.g., rolling windows, SI curves)
+#
+# Notes:
+#   - These functions should only compose lower-level helpers
+#   - Output shapes are designed for Streamlit / plotting libraries
+#   - Any change here should NOT affect return correctness
 
-def build_instrument_summary(df):
+def build_instrument_summary(df): 
     summary = []
 
     def fmt(val, flag):
@@ -397,6 +495,111 @@ def build_benchmark_summary(df_daily, name="Benchmark"):
         "T5Y": calculate_trailing_return_benchmark_eom(df_daily, 60, price_col="adj_price"),
     }])
 
+# ------------------------------------------------------------------------------
+# Instrument Return Series Builder (Plot-Ready)
+# ------------------------------------------------------------------------------
+# Purpose:
+#   - Build tidy, long-form return series for instrument-level charts
+#   - Supports rolling trailing windows and Since Inception (SI) returns
+#
+# Output Shape (tidy / long format):
+#   - period_end_date : Timestamp (x-axis)
+#   - horizon         : str  ('SI', '12M', '24M', '36M', '60M')
+#   - return          : float (decimal return, not %)
+#
+# Notes:
+#   - Line *series* over time (not curves in the mathematical sense)
+#   - Rolling windows will naturally produce NaNs for early periods
+#   - Uses log-compounding for numerical stability and correctness
+#   - No DB access; composes lower-level helpers only
+#
+# Intended Use:
+#   - Streamlit line charts
+#   - Overlaying multiple horizons for a single instrument
+# ------------------------------------------------------------------------------
+
+def build_instrument_return_series_for_chart(
+    perf_df: pd.DataFrame,
+    instrument: str,
+    return_col: str = "md_return_net",
+    windows=(12, 24, 36, 60),
+    include_si: bool = True,
+) -> pd.DataFrame:
+    """
+    Build plot-ready return series for a single instrument.
+
+    Parameters
+    ----------
+    perf_df : pd.DataFrame
+        Asset-level performance data (asset_performance_view)
+    instrument : str
+        Ticker / instrument identifier
+    return_col : str
+        Monthly return column to use (default: md_return_net)
+    windows : tuple[int]
+        Rolling trailing windows in months (e.g. 12, 24, 36, 60)
+    include_si : bool
+        Whether to include Since Inception cumulative return series
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-form dataframe with columns:
+        - period_end_date
+        - horizon
+        - return
+    """
+    # 1) Base monthly return series
+    monthly = get_instrument_monthly_returns(
+        perf_df,
+        instrument,
+        return_col=return_col,
+    )
+
+    if monthly.empty:
+        return pd.DataFrame(columns=["period_end_date", "horizon", "return"])
+
+    # 2) Rolling trailing returns (log-compounded)
+    monthly = add_rolling_trailing_returns_log(
+        monthly,
+        windows=windows,
+    )
+
+    # 3) Since Inception cumulative return (optional)
+    if include_si:
+        monthly = add_cumulative_return_si_log(monthly)
+
+    # 4) Reshape to tidy / long format
+    parts = []
+
+    for k in windows:
+        col = f"t{k}m_return"
+        tmp = (
+            monthly[["period_end_date", col]]
+            .rename(columns={col: "return"})
+            .assign(horizon=f"{k}M")
+        )
+        parts.append(tmp)
+
+    if include_si:
+        tmp = (
+            monthly[["period_end_date", "si_return"]]
+            .rename(columns={"si_return": "return"})
+            .assign(horizon="SI")
+        )
+        parts.append(tmp)
+
+    out = (
+        pd.concat(parts, ignore_index=True)
+        .dropna(subset=["return"])
+        .sort_values(["horizon", "period_end_date"])
+        .reset_index(drop=True)
+    )
+
+    return out
+
+
+
 #==============================================================================
 # ## --- CLI / PRINT HELPERS
 # ==============================================================================
@@ -484,6 +687,9 @@ def main():
 
     print("\nBenchmark Return Summary:")
     print_table_with_lines(full_benchmark_summary)
+
+    print("IMPORT CHECK:", "build_instrument_return_series_for_chart" in globals())
+
 
 if __name__ == "__main__":
     main()
