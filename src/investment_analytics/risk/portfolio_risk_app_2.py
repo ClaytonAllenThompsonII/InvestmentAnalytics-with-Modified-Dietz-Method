@@ -167,6 +167,11 @@ def main():
       margin-bottom: 0.9rem;
     }
     .perf-footnote p { margin: 0.05rem 0; }
+    
+    /* Force dataframe font consistency */
+    div[data-testid="stDataFrame"] * {
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif !important;
+    }
     </style>
     """, unsafe_allow_html=True)
 
