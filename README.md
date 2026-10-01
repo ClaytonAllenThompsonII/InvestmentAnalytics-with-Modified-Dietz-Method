@@ -1,1 +1,2 @@
 # InvestmentAnalytics with Modified Dietz Method
+Investment Analytics is an integrated portfolio analytics platform built with Python and PostgreSQL to ingest, model, analyze, and visualize portfolio, market, and fundamental data across performance, risk, and portfolio construction workflows.

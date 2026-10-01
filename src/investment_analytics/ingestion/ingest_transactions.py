@@ -1,9 +1,9 @@
 import os
-import math
 from datetime import datetime
-import psycopg2
+import psycopg
 import pandas as pd
 from dotenv import load_dotenv
+
 
 load_dotenv()  # Loads DB credentials from .env
 
@@ -17,7 +17,7 @@ DB_PASSWORD = os.getenv('DB_PASSWORD')
 def get_connection():
     """Create a psycopg2 connection to the Postgres database."""
     try:
-        return psycopg2.connect(
+        return psycopg.connect(
             host=DB_HOST,
             port=DB_PORT,
             dbname=DB_NAME,
@@ -29,44 +29,55 @@ def get_connection():
         raise
 
 
-def parse_parentheses(value_str):
+def parse_parentheses(value):
     """
-    Convert strings like '($58.19)' to float -58.19.
-    Remove '$', commas. Return None if invalid or empty.
+    Convert currency-like values such as '($58.19)' to -58.19.
+    Returns None for missing, empty, or invalid values.
     """
-    if pd.isna(value_str) or value_str.strip() == "":
+    if pd.isna(value):
         return None
-    
-    clean_str = value_str.replace('$', '').replace(',', '').strip()
-    
-    # Parentheses => negative
-    if clean_str.startswith('(') and clean_str.endswith(')'):
-        clean_str = clean_str.replace('(', '-').replace(')', '')
-    
+
+    clean = str(value).strip()
+
+    if not clean:
+        return None
+
+    clean = clean.replace("$", "").replace(",", "")
+
+    if clean.startswith("(") and clean.endswith(")"):
+        clean = f"-{clean[1:-1]}"
+
     try:
-        return float(clean_str)
+        return float(clean)
     except ValueError:
         return None
 
 
-def parse_date(date_str):
+def parse_date(value):
     """
-    Parse dates in 'MM/DD/YY' or 'MM/DD/YYYY' format. Return None if invalid/empty.
+    Parse dates in MM/DD/YY or MM/DD/YYYY format.
+    Returns None for missing, empty, or invalid values.
     """
-    if pd.isna(date_str) or str(date_str).strip() == "":
+    if pd.isna(value):
         return None
-    
+
+    value = str(value).strip()
+
+    if not value:
+        return None
+
     for fmt in ("%m/%d/%y", "%m/%d/%Y"):
         try:
-            return datetime.strptime(date_str, fmt).date()
+            return datetime.strptime(value, fmt).date()
         except ValueError:
             continue
+
     return None
 
 
 def standardize_trans_code(code):
     """
-    Convert raw trans codes to a descriptive string if you want.
+    Map Robinhood transaction codes to descriptive labels.
     Example: 'ACH' => 'Automated Clearing House', 'OCA' => 'One-Cancel-All Order', etc.
     """
     code_map = {
@@ -89,17 +100,18 @@ def standardize_trans_code(code):
     return code_map.get(code, code)  # fallback if not in dict
 
 
-def none_if_nan(x):
-    """
-    Convert float('nan') to None, and empty strings to None.
-    """
-    if x is None:
+def none_if_missing(value):
+    """Convert pandas missing values and empty strings to None."""
+    if value is None:
         return None
-    if isinstance(x, float) and math.isnan(x):
+
+    if isinstance(value, str) and not value.strip():
         return None
-    if isinstance(x, str) and not x.strip():
+
+    if pd.isna(value):
         return None
-    return x
+
+    return value
 
 
 def transaction_priority(code):
