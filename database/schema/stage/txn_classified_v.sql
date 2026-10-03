@@ -14,7 +14,7 @@ SELECT
 
     WHEN e.raw_trans_code = 'CDIV' THEN 'income'
 
-    WHEN e.raw_trans_code IN ('DFEE','GOLD') THEN 'fee'
+    WHEN e.raw_trans_code IN ('AFEE','DFEE','GOLD') THEN 'fee'
     WHEN e.raw_trans_code = 'DTAX' THEN 'tax'
 
     WHEN e.raw_trans_code = 'SPL' THEN 'corp_action'
@@ -28,7 +28,7 @@ SELECT
   /* --- helpful booleans --- */
   (e.raw_trans_code = 'ACH') AS is_external_flow,
   (e.raw_trans_code = 'CDIV') AS is_income,
-  (e.raw_trans_code IN ('DFEE','GOLD')) AS is_fee,
+  (e.raw_trans_code IN ('AFEE','DFEE','GOLD')) AS is_fee,
   (e.raw_trans_code = 'DTAX') AS is_tax,
   (e.raw_trans_code = 'SPL') AS is_corp_action,
 
@@ -54,7 +54,7 @@ SELECT
 
   /* --- NEW: cash / qty effect flags (key for Portfolio NAV + NMV separation) --- */
   CASE
-    WHEN e.raw_trans_code IN ('ACH', 'Buy','Sell','CDIV','DFEE','GOLD','DTAX','BTO','STC','STO','BTC','OEXP') THEN TRUE
+    WHEN e.raw_trans_code IN ('ACH', 'Buy','Sell','CDIV','AFEE','DFEE','GOLD','DTAX','BTO','STC','STO','BTC','OEXP') THEN TRUE
     ELSE FALSE
   END AS affects_cash_balance,
 
@@ -67,6 +67,6 @@ SELECT
   /* --- NEW: cashflow semantics (external vs internal) --- */
   (e.raw_trans_code = 'ACH') AS is_external_cashflow,
 
-  (e.raw_trans_code IN ('Buy','Sell','CDIV','DFEE','GOLD','DTAX','BTO','STC','STO','BTC','OEXP')) AS is_internal_cashflow
+  (e.raw_trans_code IN ('Buy','Sell','CDIV','AFEE','DFEE','GOLD','DTAX','BTO','STC','STO','BTC','OEXP')) AS is_internal_cashflow
 
 FROM stage.enriched_transactions_view e;

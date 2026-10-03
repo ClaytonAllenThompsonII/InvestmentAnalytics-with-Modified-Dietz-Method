@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """
-extract_load_market_data_alpha_v2.py
+Ingest Alpha Vantage daily adjusted market data into
+source.market_data_daily_adjusted.
 
-Clean v2 design:
-- NO truncation by default (safe for market data)
-- Upsert-only into market_data_daily_adjusted
-- Pull FULL only when needed; otherwise COMPACT
-- Apply portfolio inception date floor
-- Optionally skip symbols that are already up-to-date
-
-Alpha Vantage (free tier) is rate-limited. This script throttles between calls.
+The pipeline derives its equity universe from portfolio transaction history,
+adds configured benchmarks, fetches Alpha Vantage daily adjusted data, and
+upserts new market observations without truncating existing history.
 """
 
 import os
 import time
 import logging
-from datetime import datetime, date, timedelta
+from datetime import date
 from typing import Optional, Dict, List, Tuple
 
 import requests
 import pandas as pd
-import psycopg2
-from psycopg2.extras import execute_values
+import psycopg
 from dotenv import load_dotenv
 
 # ------------------------------------------------------------------------------
@@ -54,9 +49,6 @@ INCEPTION_DATE = date(2020, 7, 6)
 # COMPACT is ~100 trading days, so 120 calendar days is a safe heuristic.
 COMPACT_COVERAGE_DAYS = 120
 
-# Buffer to avoid skipping when last market day missing due to timing/holidays.
-REFRESH_BUFFER_DAYS = 5
-
 # Throttle to respect AV rate limits. (Free is typically 5 calls/min; premium higher.)
 SLEEP_BETWEEN_CALLS_SECONDS = 15
 
@@ -73,8 +65,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 # DB HELPERS
 # ------------------------------------------------------------------------------
 
-def get_connection():
-    return psycopg2.connect(
+def get_connection() -> psycopg.Connection:
+    """Create a Psycopg connection to the PostgreSQL database."""
+    return psycopg.connect(
         host=DB_HOST,
         port=int(DB_PORT),
         dbname=DB_NAME,
@@ -90,7 +83,7 @@ def get_symbols_to_pull() -> List[str]:
     """
     query = """
     SELECT DISTINCT normalized_instrument
-    FROM public.txn_classified_v
+    FROM stage.txn_classified_v
     WHERE txn_bucket = 'equity_trade'
       AND normalized_instrument IS NOT NULL
       AND normalized_instrument <> 'CASH';
@@ -115,7 +108,7 @@ def get_symbol_state(symbol: str) -> Dict[str, Optional[date]]:
     SELECT
       MAX(price_date) AS max_price_date,
       MAX(last_refreshed_date) AS max_last_refreshed
-    FROM public.market_data_daily_adjusted
+    FROM source.market_data_daily_adjusted
     WHERE instrument = %s;
     """
     with get_connection() as conn:
@@ -130,15 +123,32 @@ def get_symbol_state(symbol: str) -> Dict[str, Optional[date]]:
 
 
 def upsert_market_data(records: List[Tuple]):
+    """
+    Upsert daily market-data records into source.market_data_daily_adjusted.
+
+    Existing instrument/date rows are updated; new rows are inserted.
+    """
+    if not records:
+        return
+  
     sql = """
-        INSERT INTO public.market_data_daily_adjusted (
-            instrument, price_date,
-            open_price, high_price, low_price, close_price,
-            adjusted_close, volume,
-            dividend_amount, split_coefficient,
+        INSERT INTO source.market_data_daily_adjusted (
+            instrument,
+            price_date,
+            open_price,
+            high_price,
+            low_price,
+            close_price,
+            adjusted_close,
+            volume,
+            dividend_amount,
+            split_coefficient,
             last_refreshed_date
         )
-        VALUES %s
+        VALUES (
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s
+        )
         ON CONFLICT (instrument, price_date)
         DO UPDATE SET
             open_price = EXCLUDED.open_price,
@@ -152,10 +162,10 @@ def upsert_market_data(records: List[Tuple]):
             last_refreshed_date = EXCLUDED.last_refreshed_date,
             updated_at = now();
     """
+
     with get_connection() as conn:
         with conn.cursor() as cur:
-            execute_values(cur, sql, records, page_size=5000)
-        conn.commit()
+            cur.executemany(sql, records)
 
 
 # ------------------------------------------------------------------------------
@@ -163,16 +173,17 @@ def upsert_market_data(records: List[Tuple]):
 # ------------------------------------------------------------------------------
 
 def choose_outputsize(symbol_state: Dict[str, Optional[date]]) -> str:
-    """
-    Decide between 'full' and 'compact' based on what we already have.
-    """
+    """Choose a full or compact Alpha Vantage refresh."""
     max_date = symbol_state["max_price_date"]
+
     if max_date is None:
         return "full"
 
     gap_days = (date.today() - max_date).days
+
     if gap_days > COMPACT_COVERAGE_DAYS:
         return "full"
+    
     return "compact"
 
 
@@ -257,37 +268,13 @@ def fetch_daily_adjusted(symbol: str, outputsize: str) -> Optional[pd.DataFrame]
     ]
 
 
-def filter_df_for_load(
-    df: pd.DataFrame,
-    symbol_state: Dict[str, Optional[date]],
-) -> pd.DataFrame:
+def filter_df_for_load(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Apply:
-    - inception floor
-    - incremental > max_price_date (when present)
+    Apply the portfolio inception-date floor before loading market data.
     """
     df = df.copy()
 
-    # inception floor
-    df = df[df["price_date"] >= INCEPTION_DATE]
-
-    max_date = symbol_state["max_price_date"]
-    if max_date:
-        # incremental filter
-        df = df[df["price_date"] > max_date]
-
-    return df
-
-
-def should_skip_symbol(symbol_state: Dict[str, Optional[date]]) -> bool:
-    """
-    Optional skip logic:
-    If we already have data very recently, skip to save calls.
-    """
-    max_date = symbol_state["max_price_date"]
-    if max_date is None:
-        return False
-    return (date.today() - max_date).days <= REFRESH_BUFFER_DAYS
+    return df[df["price_date"] >= INCEPTION_DATE]
 
 
 def df_to_records(symbol: str, df: pd.DataFrame) -> List[Tuple]:
@@ -330,12 +317,6 @@ def main():
         try:
             state = get_symbol_state(symbol)
 
-            # optional: skip already-fresh symbols
-            if should_skip_symbol(state):
-                logging.info("[%d/%d] %s: up-to-date (max price_date=%s); skipping",
-                             i, len(symbols), symbol, state["max_price_date"])
-                continue
-
             outputsize = choose_outputsize(state)
             logging.info("[%d/%d] %s: fetching (%s). Current max price_date=%s",
                          i, len(symbols), symbol, outputsize, state["max_price_date"])
@@ -346,9 +327,9 @@ def main():
                 time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
                 continue
 
-            df = filter_df_for_load(df, state)
+            df = filter_df_for_load(df)
             if df.empty:
-                logging.info("%s: nothing new to load after filters", symbol)
+                logging.info("%s: no market data on or after the inception date; skipping", symbol)
                 time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
                 continue
 

@@ -20,7 +20,7 @@ BEGIN
     -- 2) Process transactions in chronological order
     FOR rec IN
         SELECT *
-        FROM equity_transactions
+        FROM stage.equity_transactions_v
         ORDER BY instrument, corrected_activity_date, transaction_id
     LOOP
 
