@@ -1,3 +1,13 @@
+"""
+Ingest Robinhood transaction history into source.transactions.
+
+This module reads the private Robinhood CSV export, normalizes dates,
+numeric values, and transaction codes, performs basic source-data quality
+checks, and fully refreshes the source.transactions table.
+
+The source file path is supplied through the ROBINHOOD_TRANSACTIONS_PATH
+environment variable so personal brokerage data remains outside the repo.
+"""
 import os
 from datetime import datetime
 import psycopg
@@ -14,8 +24,8 @@ DB_USER = os.getenv('DB_USER')
 DB_PASSWORD = os.getenv('DB_PASSWORD')
 
 
-def get_connection():
-    """Create a psycopg2 connection to the Postgres database."""
+def get_connection() -> psycopg.Connection:
+    """Create a Psycopg connection to the PostgreSQL database."""
     try:
         return psycopg.connect(
             host=DB_HOST,
@@ -82,6 +92,7 @@ def standardize_trans_code(code):
     """
     code_map = {
         'ACH': 'Automated Clearing House',
+        'AFEE': 'ADR Fee',
         'BTC': 'Buy to Close',
         'BTO': 'Buy to Open',
         'Buy': 'Buy',
@@ -131,71 +142,110 @@ def transaction_priority(code):
     else:
         return 99
 
+def check_transaction_codes(conn, df):
+    """Report transaction-code changes between the prior load and incoming CSV."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT raw_trans_code
+            FROM source.transactions
+            WHERE raw_trans_code IS NOT NULL;
+        """)
+        previous_codes = {row[0] for row in cur.fetchall()}
+
+    incoming_codes = set(
+        df["raw_trans_code"].dropna().astype(str).str.strip()
+    )
+
+    new_codes = incoming_codes - previous_codes
+    missing_codes = previous_codes - incoming_codes
+
+    if new_codes:
+        print(
+            "WARNING: New transaction codes detected: "
+            f"{sorted(new_codes)}"
+        )
+
+    if missing_codes:
+        print(
+            "NOTICE: Transaction codes present in the prior load "
+            f"but not the incoming file: {sorted(missing_codes)}"
+        )
+
+    if not new_codes and not missing_codes:
+        print("Transaction-code check passed: no code changes detected.")
 
 def ingest_transactions(csv_file_path):
     """
-    Reads the CSV, cleans data, and inserts into 'transactions' table,
-    truncating the table each time for a fresh load.
+    Load the Robinhood transaction export into source.transactions.
+
+    The source table is fully refreshed on each run. Before truncating the
+    prior load, compare existing transaction codes with the incoming CSV to
+    identify potential source-data changes.
     """
     # 1) Load CSV into a DataFrame
     df = pd.read_csv(csv_file_path)
     
-    # Rename columns to match our table's naming
+    # Rename source columns to match the database naming convention
     df.rename(columns={
         'Activity Date': 'activity_date',
         'Process Date':  'process_date',
         'Settle Date':   'settle_date',
         'Instrument':    'instrument',
         'Description':   'description',
-        
         'Trans Code':    'raw_trans_code',  # original, raw code
         'Quantity':      'raw_quantity',
         'Price':         'raw_price',
         'Amount':        'raw_amount'
     }, inplace=True, errors='ignore')
     
-    # 2) Clean / transform columns
+    # 2) Parse and normalize source values
+
+    # Dates
     df['activity_date'] = df['activity_date'].apply(parse_date)
     df['process_date']  = df['process_date'].apply(parse_date)
     df['settle_date']   = df['settle_date'].apply(parse_date)
     
-    # Convert numeric columns
+    # Convert numeric columns (values)
     df['quantity'] = pd.to_numeric(df['raw_quantity'], errors='coerce')
     df['price']    = df['raw_price'].apply(parse_parentheses)
     df['amount']   = df['raw_amount'].apply(parse_parentheses)
     
-    # Create standardized code from the raw code
+     # Preserve the original Robinhood code while adding a descriptive label
     df['trans_code'] = df['raw_trans_code'].apply(standardize_trans_code)
 
-    # Example special handling: ACH => instrument = 'CASH', quantity=0, price=None
-    ach_mask = (df['trans_code'] == 'Automated Clearing House')
+    # 3) Apply transaction-specific normalization rules
+
+    # ACH transactions represent external cash movements: ACH => instrument = 'CASH', quantity=0, price=None
+    ach_mask = (df['raw_trans_code'] == 'ACH') #Automated Clearing House
     df.loc[ach_mask, 'instrument'] = 'CASH'
     df.loc[ach_mask, 'quantity']   = 0
     df.loc[ach_mask, 'price']      = None
 
-    # If "REC" transaction has missing price, assume 0
+     # REC represents the free share received from Robinhood.
+    # If no price is supplied, use zero cost basis.
     rec_mask = (df['raw_trans_code'] == 'REC') & (df['price'].isnull())
     df.loc[rec_mask, 'price']  = 0.0
     df.loc[rec_mask, 'amount'] = 0.0
 
-    # 2B) Determine a custom priority so that on the same day,
-    # "Buy" rows appear before "Sell" rows
-    df['trans_priority'] = df['trans_code'].apply(transaction_priority)
+    # Establish deterministic ordering for transactions occurring
+    # on the same activity date. ~ "Buy" rows appear before "Sell" rows
+    df['trans_priority'] = df['raw_trans_code'].apply(transaction_priority)
 
-    # Keep track of original order to break ties beyond date + trans_priority
+    # Preserve original CSV ordering as the final tie-breaker: beyond date + trans_priority
     df['original_idx'] = df.index
 
-    # 2C) Sort the DataFrame
+    # Sort the DataFrame
     df.sort_values(
         by=['activity_date', 'trans_priority', 'original_idx'],
         ascending=True,
         inplace=True
     )
 
-    # 3) Truncate table, then insert row by row
-    truncate_sql = "TRUNCATE TABLE transactions RESTART IDENTITY;"
+    # 4) Define the source-table refresh
+    #Truncate table, then insert row by row
+    truncate_sql = "TRUNCATE TABLE source.transactions RESTART IDENTITY;"
     insert_sql = """
-        INSERT INTO transactions (
+        INSERT INTO source.transactions (
             activity_date,
             process_date,
             settle_date,
@@ -213,35 +263,37 @@ def ingest_transactions(csv_file_path):
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
 
-    conn = get_connection()
-    cursor = conn.cursor()
+    # 5) Compare the incoming source with the prior load, then refresh
+    # source.transactions in a single database transaction.
+    with get_connection() as conn:
+        check_transaction_codes(conn, df)
 
-    cursor.execute(truncate_sql)
+        with conn.cursor() as cursor:
+            cursor.execute(truncate_sql)
 
-    # Convert NaN or empty strings => None in the insertion loop
-    for _, row in df.iterrows():
-        record = (
-            none_if_nan(row['activity_date']),
-            none_if_nan(row['process_date']),
-            none_if_nan(row['settle_date']),
-            none_if_nan(row['raw_trans_code']),  # e.g. "ACH"
-            none_if_nan(row['trans_code']),      # e.g. "Automated Clearing House"
-            none_if_nan(row['instrument']),      # e.g. "CASH"
-            none_if_nan(row['description']),
-            none_if_nan(row['quantity']),
-            none_if_nan(row['price']),
-            none_if_nan(row['amount']),
-            none_if_nan(row.get('raw_quantity')),
-            none_if_nan(row.get('raw_price')),
-            none_if_nan(row.get('raw_amount'))
-        )
-        cursor.execute(insert_sql, record)
+            # Convert NaN or empty strings => None in the insertion loop
+            for _, row in df.iterrows():
+                record = (
+                    none_if_missing(row['activity_date']),
+                    none_if_missing(row['process_date']),
+                    none_if_missing(row['settle_date']),
+                    none_if_missing(row['raw_trans_code']),  # e.g. "ACH"
+                    none_if_missing(row['trans_code']),      # e.g. "Automated Clearing House"
+                    none_if_missing(row['instrument']),      # e.g. "CASH"
+                    none_if_missing(row['description']),
+                    none_if_missing(row['quantity']),
+                    none_if_missing(row['price']),
+                    none_if_missing(row['amount']),
+                    none_if_missing(row.get('raw_quantity')),
+                    none_if_missing(row.get('raw_price')),
+                    none_if_missing(row.get('raw_amount'))
+                )
+                cursor.execute(insert_sql, record)
 
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    print(f"Truncated 'transactions' and inserted {len(df)} rows from {csv_file_path}.")
+    print(
+        f"Truncated 'source.transactions' and inserted "
+        f"{len(df)} rows from {csv_file_path}."
+    )
 
 def run_post_ingestion_pipeline():
     """
@@ -268,13 +320,19 @@ def run_post_ingestion_pipeline():
 
 if __name__ == "__main__":
     # Robinhood CSV file for all transactions from direct investing account
-    csv_path = "/Users/claytonthompson/Projects/InvestmentAnalytics/data/raw/robinhood/robinhood_transactions.csv"
+    csv_path = os.getenv("ROBINHOOD_TRANSACTIONS_PATH")
+
+    if not csv_path:
+        raise ValueError(
+            "ROBINHOOD_TRANSACTIONS_PATH is not set in the environment."
+        )
+
     # Step 1: Load CSV to raw transactions
     ingest_transactions(csv_path)
     
     # Step 2: Run modeling logic via stored procedures
-    run_post_ingestion_pipeline()
+    #run_post_ingestion_pipeline()
     
-    print("ELT pipeline complete.")
+    print("Transaction ingestion complete.")
 
     # Make sure to delete automated Robinhood informational text at the bottom of a newly generated report. 
