@@ -3,9 +3,10 @@
 Ingest Alpha Vantage daily adjusted market data into
 source.market_data_daily_adjusted.
 
-The pipeline derives its equity universe from portfolio transaction history,
-adds configured benchmarks, fetches Alpha Vantage daily adjusted data, and
-upserts new market observations without truncating existing history.
+Routine refreshes derive their equity universe from currently open portfolio
+positions and configured benchmarks. Historical transaction-derived symbols
+remain available for backfills and reconciliation. Market data is upserted
+without truncating existing history.
 """
 
 import os
@@ -75,11 +76,43 @@ def get_connection() -> psycopg.Connection:
         password=DB_PASSWORD,
     )
 
-
-def get_symbols_to_pull() -> List[str]:
+# Routine refresh universe
+def get_active_symbols() -> List[str]:
     """
-    Historical universe: everything ever traded as equity + benchmarks.
-    Pull from your classification layer (preferred).
+    Return symbols requiring routine market-data refresh:
+    currently open equity positions plus configured benchmarks.
+    """
+    query = """
+    WITH latest_position AS (
+        SELECT DISTINCT ON (instrument)
+            instrument,
+            date,
+            eod_qty
+        FROM core.position_qty_eod_v
+        ORDER BY instrument, date DESC
+    )
+    SELECT instrument
+    FROM latest_position
+    WHERE eod_qty <> 0;
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+
+    symbols = [r[0] for r in rows]
+    all_syms = sorted(set(symbols + BENCHMARKS))
+
+    return sorted(set(SYMBOL_MAP.get(s, s) for s in all_syms))
+
+# Historical/backfill universe
+def get_historical_symbols() -> List[str]:
+    """
+    Return the full historical portfolio universe plus benchmarks.
+
+    Used for backfills, reconciliation, and repairing incomplete
+    historical market-data coverage.
     """
     query = """
     SELECT DISTINCT normalized_instrument
@@ -88,17 +121,16 @@ def get_symbols_to_pull() -> List[str]:
       AND normalized_instrument IS NOT NULL
       AND normalized_instrument <> 'CASH';
     """
+
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query)
             rows = cur.fetchall()
 
     symbols = [r[0] for r in rows]
-    all_syms = sorted(list(set(symbols + BENCHMARKS)))
-    # Apply remap now (and de-dup again)
-    remapped = sorted(list(set(SYMBOL_MAP.get(s, s) for s in all_syms)))
-    return remapped
+    all_syms = sorted(set(symbols + BENCHMARKS))
 
+    return sorted(set(SYMBOL_MAP.get(s, s) for s in all_syms))
 
 def get_symbol_state(symbol: str) -> Dict[str, Optional[date]]:
     """
@@ -310,8 +342,8 @@ def main():
     logging.info("Starting market data ELT (v2). No truncation; upsert-only.")
     logging.info("Inception date floor: %s", INCEPTION_DATE.isoformat())
 
-    symbols = get_symbols_to_pull()
-    logging.info("Symbols to process: %d", len(symbols))
+    symbols = get_active_symbols()
+    logging.info("Active symbols to process: %d", len(symbols))
 
     for i, symbol in enumerate(symbols, start=1):
         try:
