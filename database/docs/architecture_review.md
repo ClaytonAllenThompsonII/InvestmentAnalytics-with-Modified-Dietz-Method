@@ -47,3 +47,17 @@ Potential strategy sleeves:
 - Options – Hedge
 - Options – Income
 - Options – Directional
+
+
+## Market Data Universe
+
+Routine market-data refreshes should be driven by:
+
+- currently open equity positions derived from `core.position_qty_eod_v`; and
+- configured benchmark/reference symbols.
+
+Historical market data for exited positions is retained for prior-period
+valuation and performance analysis but does not require routine refreshes.
+
+FIFO lot accounting is not required to determine current holdings; V2
+position-quantity views provide the authoritative current equity quantity.
