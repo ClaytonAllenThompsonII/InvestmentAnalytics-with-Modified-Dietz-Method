@@ -162,7 +162,7 @@ def upsert_market_data(records: List[Tuple]):
     """
     if not records:
         return
-  
+ 
     sql = """
         INSERT INTO source.market_data_daily_adjusted (
             instrument,
@@ -220,6 +220,12 @@ def choose_outputsize(symbol_state: Dict[str, Optional[date]]) -> str:
 
 
 def fetch_daily_adjusted(symbol: str, outputsize: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch Alpha Vantage daily adjusted market data for a symbol.
+
+    Returns a normalized DataFrame containing prices, volume, dividends,
+    split coefficients, and the provider refresh date.
+    """
     url = (
         "https://www.alphavantage.co/query"
         f"?function=TIME_SERIES_DAILY_ADJUSTED"
@@ -300,16 +306,27 @@ def fetch_daily_adjusted(symbol: str, outputsize: str) -> Optional[pd.DataFrame]
     ]
 
 
-def filter_df_for_load(df: pd.DataFrame) -> pd.DataFrame:
+def filter_df_for_load(symbol: str, df: pd.DataFrame) -> pd.DataFrame:
     """
-    Apply the portfolio inception-date floor before loading market data.
+    Apply market-data retention rules before loading.
+
+    Benchmarks retain full available history.
+    Portfolio securities retain history from portfolio inception onward.
     """
     df = df.copy()
+
+    if symbol in BENCHMARKS:
+        return df
 
     return df[df["price_date"] >= INCEPTION_DATE]
 
 
 def df_to_records(symbol: str, df: pd.DataFrame) -> List[Tuple]:
+    """
+    Convert normalized market-data rows into database-ready tuples.
+
+    Rows missing required valuation fields are skipped.
+    """
     records: List[Tuple] = []
     for _, row in df.iterrows():
         # require key fields for valuation
@@ -338,40 +355,75 @@ def df_to_records(symbol: str, df: pd.DataFrame) -> List[Tuple]:
 # MAIN
 # ------------------------------------------------------------------------------
 
-def main():
-    logging.info("Starting market data ELT (v2). No truncation; upsert-only.")
-    logging.info("Inception date floor: %s", INCEPTION_DATE.isoformat())
+def main(mode: str = "refresh"):
+    """
+    Run the market-data ingestion pipeline.
 
-    symbols = get_active_symbols()
-    logging.info("Active symbols to process: %d", len(symbols))
+    refresh:
+        Refresh currently active portfolio holdings and configured benchmarks,
+        using compact or full Alpha Vantage pulls based on data freshness.
+
+    rebuild:
+        Rebuild the full historical portfolio universe and benchmarks using
+        full Alpha Vantage history for every symbol.
+    """
+    logging.info("Starting market data ELT (v2). Mode=%s", mode)
+    logging.info("Portfolio-security inception date floor: %s", INCEPTION_DATE.isoformat())
+
+    if mode == "refresh":
+        symbols = get_active_symbols()
+        force_full = False
+
+    elif mode == "rebuild":
+        symbols = get_historical_symbols()
+        force_full = True
+
+    else:
+        raise ValueError(
+            "mode must be either 'refresh' or 'rebuild'"
+        )
 
     for i, symbol in enumerate(symbols, start=1):
         try:
             state = get_symbol_state(symbol)
 
-            outputsize = choose_outputsize(state)
-            logging.info("[%d/%d] %s: fetching (%s). Current max price_date=%s",
-                         i, len(symbols), symbol, outputsize, state["max_price_date"])
+            if force_full:
+                outputsize = "full"
+            else:
+                outputsize = choose_outputsize(state)
+
+            logging.info(
+                "[%d/%d] %s: fetching (%s). Current max price_date=%s",
+                i,
+                len(symbols),
+                symbol,
+                outputsize,
+                state["max_price_date"],
+            )
 
             df = fetch_daily_adjusted(symbol, outputsize=outputsize)
+
             if df is None or df.empty:
                 logging.info("%s: no data returned; skipping", symbol)
                 time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
                 continue
 
-            df = filter_df_for_load(df)
+            df = filter_df_for_load(symbol, df)
+
             if df.empty:
-                logging.info("%s: no market data on or after the inception date; skipping", symbol)
+                logging.info("%s: no market data remaining after retention filters; skipping", symbol)
                 time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
                 continue
 
             records = df_to_records(symbol, df)
+
             if not records:
                 logging.info("%s: no valid records after parsing; skipping", symbol)
                 time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
                 continue
 
             upsert_market_data(records)
+
             logging.info("%s: upserted %d rows (from %s to %s)",
                          symbol, len(records), df["price_date"].min(), df["price_date"].max())
 
@@ -390,6 +442,21 @@ def main():
 
     logging.info("Done.")
 
-
+# ------------------------------------------------------------------------------
+# USAGE
+# ------------------------------------------------------------------------------
+#
+# Routine refresh:
+#   python -m investment_analytics.ingestion.extract_load_market_data_alpha_v2
+#
+# Historical rebuild / reconciliation:
+#   python -c "from investment_analytics.ingestion.extract_load_market_data_alpha_v2 import main; main('rebuild')"
+#
+# refresh:
+#   Current holdings + benchmarks; compact/full selected based on freshness.
+#
+# rebuild:
+#   Full historical portfolio universe + benchmarks; forces full-history pulls.
+#
 if __name__ == "__main__":
     main()
