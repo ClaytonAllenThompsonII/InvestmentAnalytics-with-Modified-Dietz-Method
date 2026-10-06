@@ -266,3 +266,74 @@ def calculate_ttm_metrics(
     )
 
     return result
+
+def calculate_cagr(
+    df: pd.DataFrame,
+    value_column: str,
+    years: int,
+    tolerance_days: int = 31,
+) -> float:
+    """
+    Calculate CAGR for an annual income-statement metric.
+
+    The calculation uses the latest available annual observation and matches
+    it to the corresponding fiscal period the requested number of years
+    earlier.
+
+    Returns NaN when the required historical period is unavailable or when
+    either endpoint is non-positive.
+    """
+
+    if years <= 0:
+        raise ValueError("CAGR years must be greater than zero.")
+
+    result = prepare_income_statement(df)
+
+    frequencies = result["frequency"].dropna().unique()
+
+    if len(frequencies) != 1 or frequencies[0] != "annual":
+        raise ValueError(
+            "CAGR requires annual income-statement data."
+        )
+
+    if value_column not in result.columns:
+        raise ValueError(
+            f"Column '{value_column}' is not available."
+        )
+
+    valid = result.dropna(
+        subset=["fiscal_date", value_column]
+    )
+
+    if valid.empty:
+        return float("nan")
+
+    latest = valid.iloc[-1]
+
+    end_date = latest["fiscal_date"]
+    end_value = latest[value_column]
+
+    target_start_date = (
+        end_date - pd.DateOffset(years=years)
+    )
+
+    history = (
+        valid.set_index("fiscal_date")[value_column]
+        .sort_index()
+    )
+
+    start_match = history.reindex(
+        pd.DatetimeIndex([target_start_date]),
+        method="nearest",
+        tolerance=pd.Timedelta(days=tolerance_days),
+    )
+
+    start_value = start_match.iloc[0]
+
+    if pd.isna(start_value):
+        return float("nan")
+
+    if start_value <= 0 or end_value <= 0:
+        return float("nan")
+
+    return (end_value / start_value) ** (1 / years) - 1
