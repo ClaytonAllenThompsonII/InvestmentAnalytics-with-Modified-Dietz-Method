@@ -5,6 +5,7 @@ from investment_analytics.fundamentals.income_statement import (
     calculate_income_statement_metrics,
     prepare_income_statement,
     calculate_ttm_metrics,
+    calculate_cagr,
 )
 
 
@@ -203,3 +204,61 @@ def test_ttm_metrics_reject_annual_data():
         match="TTM metrics require quarterly",
     ):
         calculate_ttm_metrics(df)
+
+
+def test_three_year_cagr():
+    df = pd.DataFrame(
+        {
+            "instrument": ["TEST"] * 4,
+            "fiscal_date": [
+                "2022-12-31",
+                "2023-12-31",
+                "2024-12-31",
+                "2025-12-31",
+            ],
+            "frequency": ["annual"] * 4,
+            "reported_currency": ["USD"] * 4,
+            "total_revenue": [
+                100.0,
+                120.0,
+                144.0,
+                172.8,
+            ],
+        }
+    )
+
+    result = calculate_cagr(
+        df,
+        "total_revenue",
+        years=3,
+    )
+
+    assert result == pytest.approx(0.20)
+
+
+def test_cagr_is_missing_when_start_period_is_missing():
+    df = pd.DataFrame(
+        {
+            "instrument": ["TEST"] * 3,
+            "fiscal_date": [
+                "2023-12-31",
+                "2024-12-31",
+                "2025-12-31",
+            ],
+            "frequency": ["annual"] * 3,
+            "reported_currency": ["USD"] * 3,
+            "total_revenue": [
+                120.0,
+                144.0,
+                172.8,
+            ],
+        }
+    )
+
+    result = calculate_cagr(
+        df,
+        "total_revenue",
+        years=3,
+    )
+
+    assert pd.isna(result)
