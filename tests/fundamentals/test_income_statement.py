@@ -1,11 +1,13 @@
 import pandas as pd
 import pytest
+from datetime import date
 
 from investment_analytics.fundamentals.income_statement import (
     calculate_income_statement_metrics,
     prepare_income_statement,
     calculate_ttm_metrics,
     calculate_cagr,
+    build_income_statement_summary,
 )
 
 
@@ -262,3 +264,140 @@ def test_cagr_is_missing_when_start_period_is_missing():
     )
 
     assert pd.isna(result)
+
+
+
+def test_build_income_statement_summary():
+    annual_df = pd.DataFrame(
+        {
+            "instrument": ["TEST"] * 6,
+            "fiscal_date": [
+                "2020-12-31",
+                "2021-12-31",
+                "2022-12-31",
+                "2023-12-31",
+                "2024-12-31",
+                "2025-12-31",
+            ],
+            "frequency": ["annual"] * 6,
+            "reported_currency": ["USD"] * 6,
+            "total_revenue": [
+                100.0,
+                120.0,
+                144.0,
+                172.8,
+                207.36,
+                248.832,
+            ],
+            "operating_income": [
+                20.0,
+                24.0,
+                28.8,
+                34.56,
+                41.472,
+                49.7664,
+            ],
+        }
+    )
+
+    quarterly_df = pd.DataFrame(
+        {
+            "instrument": ["TEST"] * 8,
+            "fiscal_date": [
+                "2024-09-30",
+                "2024-12-31",
+                "2025-03-31",
+                "2025-06-30",
+                "2025-09-30",
+                "2025-12-31",
+                "2026-03-31",
+                "2026-06-30",
+            ],
+            "frequency": ["quarterly"] * 8,
+            "reported_currency": ["USD"] * 8,
+            "total_revenue": [
+                100.0,
+                110.0,
+                120.0,
+                130.0,
+                120.0,
+                132.0,
+                144.0,
+                156.0,
+            ],
+            "gross_profit": [
+                50.0,
+                55.0,
+                60.0,
+                65.0,
+                60.0,
+                66.0,
+                72.0,
+                78.0,
+            ],
+            "operating_income": [
+                20.0,
+                22.0,
+                24.0,
+                26.0,
+                24.0,
+                26.4,
+                28.8,
+                31.2,
+            ],
+            "ebitda": [
+                25.0,
+                27.5,
+                30.0,
+                32.5,
+                30.0,
+                33.0,
+                36.0,
+                39.0,
+            ],
+            "net_income": [
+                10.0,
+                11.0,
+                12.0,
+                13.0,
+                12.0,
+                13.2,
+                14.4,
+                15.6,
+            ],
+            "research_and_development": [5.0] * 8,
+            "selling_general_and_administrative": [10.0] * 8,
+        }
+    )
+
+    summary = build_income_statement_summary(
+        annual_df,
+        quarterly_df,
+    )
+
+    assert summary["instrument"] == "TEST"
+    assert summary["reported_currency"] == "USD"
+
+    assert summary["latest_quarter"]["fiscal_date"] == date(
+        2026,
+        6,
+        30,
+    )
+
+    assert summary["latest_quarter"]["revenue"] == pytest.approx(156.0)
+    assert summary["latest_quarter"]["revenue_growth"] == pytest.approx(0.20)
+
+    assert summary["ttm"]["revenue"] == pytest.approx(552.0)
+    assert summary["ttm"]["revenue_growth"] == pytest.approx(0.20)
+
+    assert summary["long_term"]["revenue_cagr_3y"] == pytest.approx(0.20)
+    assert summary["long_term"]["revenue_cagr_5y"] == pytest.approx(0.20)
+
+    assert isinstance(
+        summary["latest_quarter"]["revenue"],
+        float,
+    )
+    assert isinstance(
+        summary["latest_quarter"]["fiscal_date"],
+        date,
+    )    
