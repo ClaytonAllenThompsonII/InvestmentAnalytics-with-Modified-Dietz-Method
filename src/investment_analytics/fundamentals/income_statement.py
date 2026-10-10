@@ -337,3 +337,80 @@ def calculate_cagr(
         return float("nan")
 
     return (end_value / start_value) ** (1 / years) - 1
+
+def _to_float(value) -> float:
+    """Convert a pandas/NumPy numeric scalar to a native Python float."""
+
+    return float(value)
+
+def build_income_statement_summary(
+    annual_df: pd.DataFrame,
+    quarterly_df: pd.DataFrame,
+) -> dict:
+    """
+    Build a compact income-statement analytical summary.
+
+    Combines the latest quarterly metrics, trailing-twelve-month metrics,
+    and longer-term annual growth measures.
+    """
+
+    quarterly_metrics = calculate_income_statement_metrics(
+        quarterly_df
+    )
+
+    ttm_metrics = calculate_ttm_metrics(
+        quarterly_df
+    )
+
+    latest_quarter = quarterly_metrics.iloc[-1]
+    latest_ttm = ttm_metrics.iloc[-1]
+
+    instrument = latest_quarter["instrument"]
+    reported_currency = latest_quarter["reported_currency"]
+
+    return {
+        "instrument": instrument,
+        "reported_currency": reported_currency,
+        "latest_quarter": {
+            "fiscal_date": latest_quarter["fiscal_date"].date(),
+            "revenue": _to_float(latest_quarter["total_revenue"]),
+            "revenue_growth": _to_float(latest_quarter["revenue_growth"]),
+            "gross_margin": _to_float(latest_quarter["gross_margin"]),
+            "operating_margin": _to_float(latest_quarter["operating_margin"]),
+            "ebitda_margin": _to_float(latest_quarter["ebitda_margin"]),
+            "net_margin": _to_float(latest_quarter["net_margin"]),
+        },
+        "ttm": {
+            "revenue": _to_float(latest_ttm["total_revenue_ttm"]),
+            "revenue_growth": _to_float(latest_ttm["revenue_growth_ttm"]),
+            "gross_margin": _to_float(latest_ttm["gross_margin_ttm"]),
+            "operating_margin": _to_float(
+                latest_ttm["operating_margin_ttm"]
+            ),
+            "ebitda_margin": _to_float(latest_ttm["ebitda_margin_ttm"]),
+            "net_margin": _to_float(latest_ttm["net_margin_ttm"]),
+        },
+        "long_term": {
+            "revenue_cagr_3y": _to_float(
+                calculate_cagr(
+                    annual_df,
+                    "total_revenue",
+                    years=3,
+                )
+            ),
+            "revenue_cagr_5y": _to_float(
+                calculate_cagr(
+                    annual_df,
+                    "total_revenue",
+                    years=5,
+                )
+            ),
+            "operating_income_cagr_3y": _to_float(
+                calculate_cagr(
+                    annual_df,
+                    "operating_income",
+                    years=3,
+                )
+            ),
+        },
+    }
