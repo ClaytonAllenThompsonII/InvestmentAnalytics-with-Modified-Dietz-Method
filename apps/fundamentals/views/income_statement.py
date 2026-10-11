@@ -1,3 +1,4 @@
+import math
 import streamlit as st
 
 from investment_analytics.data_access.fundamentals import (
@@ -8,11 +9,20 @@ from investment_analytics.data_access.fundamentals import (
 from investment_analytics.fundamentals.income_statement import (
     build_income_statement_summary,
     calculate_income_statement_metrics,
+    calculate_ttm_metrics,
 )
 
 from charts.income_statement import (
     build_revenue_growth_chart,
 )
+
+def _format_percent(value: float | None) -> str:
+    """Format a percentage while handling missing values."""
+
+    if value is None or not math.isfinite(value):
+        return "—"
+
+    return f"{value:.1%}"
 
 
 def _format_amount(value: float) -> str:
@@ -72,11 +82,13 @@ def render_income_statement_page():
         annual
     )
 
-    revenue_growth_chart = build_revenue_growth_chart(
-        annual_metrics,
-        currency=currency,
+    quarterly_metrics = calculate_income_statement_metrics(
+        quarterly
     )
 
+    ttm_metrics = calculate_ttm_metrics(
+        quarterly
+    )
 
     st.caption(
         f"{instrument} · Reporting currency: {currency} · "
@@ -142,15 +154,43 @@ def render_income_statement_page():
 
     col2.metric(
         "5Y Revenue CAGR",
-        f"{long_term['revenue_cagr_5y']:.1%}",
+        _format_percent(long_term["revenue_cagr_5y"]),
     )
 
     col3.metric(
         "3Y Operating Income CAGR",
-        f"{long_term['operating_income_cagr_3y']:.1%}",
+        _format_percent(long_term["operating_income_cagr_3y"]),
+    )
+
+    st.subheader("Revenue & Growth")
+    revenue_frequency = st.segmented_control(
+        "Period",
+        options=["Quarterly", "Annual" ],
+        default="Quarterly",
+        label_visibility="collapsed",
+    )
+    if revenue_frequency == "Quarterly":
+        revenue_chart_data = quarterly_metrics
+        chart_frequency = "quarterly"
+        chart_periods = 12
+    else:
+        revenue_chart_data = annual_metrics
+        chart_frequency = "annual"
+        chart_periods = 10
+
+    revenue_growth_chart = build_revenue_growth_chart(
+        revenue_chart_data,
+        currency=currency,
+        instrument=instrument,
+        frequency=chart_frequency,
+        periods=chart_periods,
+        ttm_df=ttm_metrics if chart_frequency == "quarterly" else None,
     )
 
     st.plotly_chart(
-            revenue_growth_chart,
-            use_container_width=True,
-        )
+        revenue_growth_chart,
+        use_container_width=True,
+        config={
+            "displayModeBar": False,
+        },
+    )
