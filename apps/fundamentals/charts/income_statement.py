@@ -72,7 +72,9 @@ def build_revenue_growth_chart(
     df: pd.DataFrame,
     currency: str,
     instrument: str,
+    frequency: str = "annual",
     periods: int = 10,
+    ttm_df: pd.DataFrame | None = None,
 ) -> go.Figure:
     """
     Build an annual revenue and YoY growth chart.
@@ -96,38 +98,73 @@ def build_revenue_growth_chart(
         chart_df["total_revenue"] / scale
     )
 
-    chart_df["year"] = (
-        pd.to_datetime(chart_df["fiscal_date"])
-        .dt.year
-        .astype(str)
+    if frequency == "quarterly" and ttm_df is not None:
+        ttm_columns = ttm_df[
+            [
+                "fiscal_date",
+                "total_revenue_ttm",
+                "revenue_growth_ttm",
+            ]
+        ].copy()
+
+        chart_df = chart_df.merge(
+            ttm_columns,
+            on="fiscal_date",
+            how="left",
+        )
+
+        chart_df["ttm_revenue_display"] = (
+            chart_df["total_revenue_ttm"] / scale
+        )
+
+    fiscal_dates = pd.to_datetime(
+        chart_df["fiscal_date"]
     )
+
+    if frequency == "quarterly":
+        chart_df["period_label"] = (
+            "Q"
+            + fiscal_dates.dt.quarter.astype(str)
+            + " '"
+            + fiscal_dates.dt.strftime("%y")
+        )
+    else:
+        chart_df["period_label"] = (
+            fiscal_dates.dt.year.astype(str)
+        )
 
     fig = make_subplots(
         specs=[[{"secondary_y": True}]]
     )
 
+    revenue_customdata = chart_df[
+        ["revenue_display"]
+    ].to_numpy()
+
+    revenue_hovertemplate = (
+        f"Revenue: {currency} %{{customdata[0]:,.2f}}{unit}"
+        "<extra></extra>"
+    )
+
     fig.add_trace(
         go.Bar(
-            x=chart_df["year"],
+            x=chart_df["period_label"],
             y=chart_df["revenue_display"],
-            customdata=chart_df["total_revenue"],
+            customdata=revenue_customdata,
             name="Revenue",
             marker=dict(
                 color=colors["primary"],
                 opacity=0.48,
                 line=dict(width=0),
             ),
-            hovertemplate=(
-                f"{currency} %{{customdata:,.0f}}"
-                "<extra>Revenue</extra>"
-            ),
+            hovertemplate=revenue_hovertemplate,
         ),
         secondary_y=False,
     )
 
     fig.add_trace(
         go.Scatter(
-            x=chart_df["year"],
+            x=chart_df["period_label"],
             y=chart_df["revenue_growth"],
             name="YoY Growth",
             mode="lines+markers",
@@ -140,12 +177,64 @@ def build_revenue_growth_chart(
                 size=7,
             ),
             hovertemplate=(
-                "%{y:.1%}"
-                "<extra>YoY Growth</extra>"
+                "YoY Growth: %{y:.1%}"
+                "<extra></extra>"
             ),
         ),
         secondary_y=True,
     )
+
+    if frequency == "quarterly" and ttm_df is not None:
+        chart_df["ttm_revenue_text"] = chart_df[
+            "ttm_revenue_display"
+        ].apply(
+            lambda value: (
+                "—"
+                if pd.isna(value)
+                else f"{currency} {value:,.2f}{unit}"
+            )
+        )
+
+        chart_df["ttm_growth_text"] = chart_df[
+            "revenue_growth_ttm"
+        ].apply(
+            lambda value: (
+                "—"
+                if pd.isna(value)
+                else f"{value:.1%}"
+            )
+        )
+
+        ttm_customdata = chart_df[
+            [
+                "ttm_revenue_text",
+                "ttm_growth_text",
+            ]
+        ].to_numpy()
+
+        fig.add_trace(
+            go.Scatter(
+                x=chart_df["period_label"],
+                y=chart_df["revenue_growth"],
+                customdata=ttm_customdata,
+                mode="markers",
+                marker=dict(
+                    size=0,
+                    opacity=0,
+                ),
+                name="",
+                showlegend=False,
+                hovertemplate=(
+                    "<br>"
+                    "TTM Revenue: %{customdata[0]}"
+                    "<br>"
+                    "TTM YoY Growth: %{customdata[1]}"
+                    "<br>&nbsp;"
+                    "<extra></extra>"
+                ),
+            ),
+            secondary_y=True,
+        )
 
     fig.update_layout(
         height=420,
@@ -161,6 +250,12 @@ def build_revenue_growth_chart(
             color="#C9CDD4",
         ),
         hovermode="x unified",
+        hoverlabel=dict(
+            align="left",
+            font=dict(
+                size=12,
+            ),
+        ),
         bargap=0.28,
         legend=dict(
             orientation="h",
