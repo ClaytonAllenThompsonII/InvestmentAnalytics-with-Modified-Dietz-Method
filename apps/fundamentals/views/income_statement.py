@@ -1,4 +1,5 @@
 import streamlit as st
+import math
 
 from investment_analytics.data_access.fundamentals import (
     get_income_statement_instruments,
@@ -13,6 +14,14 @@ from investment_analytics.fundamentals.income_statement import (
 from charts.income_statement import (
     build_revenue_growth_chart,
 )
+
+def _format_percent(value: float | None) -> str:
+    """Format a percentage while handling missing values."""
+
+    if value is None or not math.isfinite(value):
+        return "—"
+
+    return f"{value:.1%}"
 
 
 def _format_amount(value: float) -> str:
@@ -75,6 +84,7 @@ def render_income_statement_page():
     revenue_growth_chart = build_revenue_growth_chart(
         annual_metrics,
         currency=currency,
+        instrument=instrument,
     )
 
 
@@ -142,15 +152,20 @@ def render_income_statement_page():
 
     col2.metric(
         "5Y Revenue CAGR",
-        f"{long_term['revenue_cagr_5y']:.1%}",
+        _format_percent(long_term["revenue_cagr_5y"]),
     )
 
     col3.metric(
         "3Y Operating Income CAGR",
-        f"{long_term['operating_income_cagr_3y']:.1%}",
+        _format_percent(long_term["operating_income_cagr_3y"]),
     )
 
+    st.subheader("Revenue & Growth")
+
     st.plotly_chart(
-            revenue_growth_chart,
-            use_container_width=True,
-        )
+        revenue_growth_chart,
+        use_container_width=True,
+        config={
+            "displayModeBar": False,
+        },
+    )
