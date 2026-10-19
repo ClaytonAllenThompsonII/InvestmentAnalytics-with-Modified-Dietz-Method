@@ -5,6 +5,3 @@ SELECT
 FROM core.cash_events_v
 GROUP BY date
 ORDER BY date;
-
--- Alter Schema to core
-ALTER VIEW public.daily_cash_change_v SET SCHEMA core;

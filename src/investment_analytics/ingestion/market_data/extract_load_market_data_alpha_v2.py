@@ -50,8 +50,15 @@ INCEPTION_DATE = date(2020, 7, 6)
 # COMPACT is ~100 trading days, so 120 calendar days is a safe heuristic.
 COMPACT_COVERAGE_DAYS = 120
 
-# Throttle to respect AV rate limits. (Free is typically 5 calls/min; premium higher.)
-SLEEP_BETWEEN_CALLS_SECONDS = 15
+# Premium Alpha Vantage request pacing and bounded rate-limit retries.
+SLEEP_BETWEEN_CALLS_SECONDS = 1
+RATE_LIMIT_BACKOFF_SECONDS = 60
+MAX_RATE_LIMIT_ATTEMPTS = 3
+
+
+class AlphaVantageRateLimitError(RuntimeError):
+    """Raised only for recognized Alpha Vantage rate-limit responses."""
+
 
 # Symbol remap (keep your canonical tickers)
 SYMBOL_MAP = {"FB": "META"}
@@ -226,29 +233,53 @@ def fetch_daily_adjusted(symbol: str, outputsize: str) -> Optional[pd.DataFrame]
     Returns a normalized DataFrame containing prices, volume, dividends,
     split coefficients, and the provider refresh date.
     """
-    url = (
-        "https://www.alphavantage.co/query"
-        f"?function=TIME_SERIES_DAILY_ADJUSTED"
-        f"&symbol={symbol}"
-        f"&outputsize={outputsize}"
-        f"&apikey={ALPHAVANTAGE_API_KEY}"
-    )
-
+    # Use requests params for predictable query encoding. The API key is still
+    # sent as a URL query parameter; never log the final URL or raw exceptions.
     try:
-        r = requests.get(url, timeout=30)
+        r = requests.get(
+            "https://www.alphavantage.co/query",
+            params={
+                "function": "TIME_SERIES_DAILY_ADJUSTED",
+                "symbol": symbol,
+                "outputsize": outputsize,
+                "apikey": ALPHAVANTAGE_API_KEY,
+            },
+            timeout=30,
+        )
+        if r.status_code == 429:
+            raise AlphaVantageRateLimitError("HTTP 429")
         r.raise_for_status()
         payload = r.json()
-    except Exception as e:
-        logging.error("Request error for %s: %s", symbol, e)
+    except requests.RequestException as exc:
+        # HTTPError/RequestException text may contain the request URL and key.
+        logging.error("Request error for %s (%s)", symbol, type(exc).__name__)
+        return None
+    except ValueError:
+        logging.error("Invalid JSON response for %s", symbol)
         return None
 
-    if "Error Message" in payload:
-        logging.error("Alpha Vantage error for %s: %s", symbol, payload["Error Message"])
+    if not isinstance(payload, dict):
+        logging.error("Unexpected Alpha Vantage response type for %s", symbol)
         return None
 
     if "Note" in payload:
-        # Rate limit / throttling note
-        raise RuntimeError(f"Alpha Vantage throttling: {payload['Note']}")
+        raise AlphaVantageRateLimitError("Provider throttle note")
+
+    if "Information" in payload:
+        # Alpha Vantage also uses 'Information' for rate-limit notices and
+        # unrelated messages (e.g., plan/endpoint eligibility).
+        message = str(payload["Information"]).lower()
+        if any(term in message for term in (
+            "rate limit", "call frequency", "calls per", "requests per", "rate-limit",
+        )):
+            raise AlphaVantageRateLimitError("Provider rate-limit information")
+        logging.error("Alpha Vantage informational response for %s (not a rate limit)", symbol)
+        return None
+
+    if "Error Message" in payload:
+        # Avoid logging provider text that could contain request details.
+        logging.error("Alpha Vantage reported an API error for %s", symbol)
+        return None
 
     meta = payload.get("Meta Data", {})
     ts_daily = payload.get("Time Series (Daily)", {})
@@ -304,6 +335,27 @@ def fetch_daily_adjusted(symbol: str, outputsize: str) -> Optional[pd.DataFrame]
             "last_refreshed_date",
         ]
     ]
+
+
+def fetch_daily_adjusted_with_retry(symbol: str, outputsize: str) -> Optional[pd.DataFrame]:
+    """Retry the same symbol on throttling; stop after a bounded number of attempts."""
+    for attempt in range(1, MAX_RATE_LIMIT_ATTEMPTS + 1):
+        try:
+            return fetch_daily_adjusted(symbol, outputsize)
+        except AlphaVantageRateLimitError:
+            if attempt == MAX_RATE_LIMIT_ATTEMPTS:
+                logging.error(
+                    "%s: rate limit persisted after %d attempts; stopping ingestion",
+                    symbol, MAX_RATE_LIMIT_ATTEMPTS,
+                )
+                raise
+            logging.warning(
+                "%s: rate limited (attempt %d/%d); retrying SAME symbol in %ds",
+                symbol, attempt, MAX_RATE_LIMIT_ATTEMPTS,
+                RATE_LIMIT_BACKOFF_SECONDS,
+            )
+            time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+    return None
 
 
 def filter_df_for_load(symbol: str, df: pd.DataFrame) -> pd.DataFrame:
@@ -401,7 +453,7 @@ def main(mode: str = "refresh"):
                 state["max_price_date"],
             )
 
-            df = fetch_daily_adjusted(symbol, outputsize=outputsize)
+            df = fetch_daily_adjusted_with_retry(symbol, outputsize=outputsize)
 
             if df is None or df.empty:
                 logging.info("%s: no data returned; skipping", symbol)
@@ -429,11 +481,10 @@ def main(mode: str = "refresh"):
 
             time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
 
-        except RuntimeError as e:
-            # throttling note -> back off harder
-            logging.error("Throttle hit: %s", e)
-            logging.info("Sleeping 60 seconds then continuing...")
-            time.sleep(60)
+        except AlphaVantageRateLimitError:
+            # Don't silently move to the next security when provider limits persist.
+            logging.error("Market-data ingestion halted at %s; retry the run later", symbol)
+            raise SystemExit(1)
 
         except Exception as e:
             logging.error("Error processing %s: %s", symbol, e)
@@ -445,18 +496,23 @@ def main(mode: str = "refresh"):
 # ------------------------------------------------------------------------------
 # USAGE
 # ------------------------------------------------------------------------------
+# Run from repository root with virtual environment active.
+# Requires ALPHAVANTAGE_PREMIUM_API_KEY in .env.
 #
-# Routine refresh:
-#   python -m investment_analytics.ingestion.extract_load_market_data_alpha_v2
+# 1. Preview — Display active securities and benchmarks (no API calls or writes).
+#    PYTHONPATH=src python -c "from investment_analytics.ingestion.market_data.extract_load_market_data_alpha_v2 import get_active_symbols; print(get_active_symbols())"
 #
-# Historical rebuild / reconciliation:
-#   python -c "from investment_analytics.ingestion.extract_load_market_data_alpha_v2 import main; main('rebuild')"
+# 2. Refresh (Routine) — Update current holdings and benchmarks.
+#    PYTHONPATH=src python -m investment_analytics.ingestion.market_data.extract_load_market_data_alpha_v2
 #
-# refresh:
-#   Current holdings + benchmarks; compact/full selected based on freshness.
+# 3. Rebuild — Re-fetch full history for historical holdings and benchmarks.
+#    PYTHONPATH=src python -c "from investment_analytics.ingestion.market_data.extract_load_market_data_alpha_v2 import main; main('rebuild')"
 #
-# rebuild:
-#   Full historical portfolio universe + benchmarks; forces full-history pulls.
+# Notes:
+#   - Refresh selects compact/full history based on data freshness.
+#   - Existing prices are upserted; no tables are truncated.
+#   - Rate limits retry the SAME symbol (3 attempts, 60s apart), then stop.
+#   - Requests are paced 1 second apart on normal processing.
 #
 if __name__ == "__main__":
     main()
