@@ -22,9 +22,3 @@ SELECT
 FROM stage.txn_classified_v
 WHERE affects_cash_balance = TRUE
   AND cash_flow IS NOT NULL;
-
-
-
-
-  -- Note) Move the view object into core
-ALTER VIEW public.cash_events_v SET SCHEMA core;
