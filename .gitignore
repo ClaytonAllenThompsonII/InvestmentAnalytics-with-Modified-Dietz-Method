@@ -126,3 +126,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+#company colors
+apps/fundamentals/assets/company_chart_colors.local.json

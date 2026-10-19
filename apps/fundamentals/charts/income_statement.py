@@ -1,51 +1,32 @@
+import json
+from pathlib import Path
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 
-COMPANY_CHART_COLORS = {
-    "NVO": {
-        "primary": "#00008F",
-        "secondary": "#6E8CFF",
-    },
-    "TOST": {
-        "primary": "#EF4B24",
-        "secondary": "#FF9A73",
-    },
-    "NU": {
-        "primary": "#830AD1",
-        "secondary": "#C084FC",
-    },
-    "CPNG": {
-        "primary": "#3FACDB",
-        "secondary": "#F9CB38",
-    },
-    "TSM": {
-        "primary": "#E60012",
-        "secondary": "#FF8A94",
-    },
-    "PONY": {
-        "primary": "#73DBE5",
-        "secondary": "#D2D7DC",
-    },
-    "SKHY": {
-        "primary": "#ED6900",
-        "secondary": "#D6001F",
-    },
-    "CBRS": {
-        "primary": "#F25A29",
-        "secondary": "#E7EDF6",
-    },
-    "SPCX": {
-        "primary": "#AEB8C5",
-        "secondary": "#F4F7FB",
-    },
-}
-
 DEFAULT_CHART_COLORS = {
     "primary": "#806CEB",
     "secondary": "#B5A8F5",
 }
+
+
+COLOR_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "assets"
+    / "company_chart_colors.local.json"
+)
+
+
+def _load_company_chart_colors() -> dict:
+    if not COLOR_CONFIG_PATH.exists():
+        return {}
+
+    with COLOR_CONFIG_PATH.open("r") as file:
+        return json.load(file)
+
+
+COMPANY_CHART_COLORS = _load_company_chart_colors()
 
 
 def _get_revenue_scale(values: pd.Series) -> tuple[float, str]:
