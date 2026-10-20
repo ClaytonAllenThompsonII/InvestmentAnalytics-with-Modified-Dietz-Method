@@ -122,33 +122,57 @@ calculated_dimensions AS (
     SELECT
         bd.*,
 
-        -- "effective event date" for timing (PAYMENT DATE for dividends)
+        -- Economic event timestamp
         COALESCE(
-            CASE WHEN bd.raw_trans_code::text = 'CDIV'::text THEN bd.payment_date END,
+            CASE
+                WHEN bd.raw_trans_code = 'CDIV'
+                THEN bd.payment_date
+            END,
             bd.record_date,
             bd.activity_date
         )::timestamptz AS event_ts,
 
-        date_part('day'::text, bd.period_end_date - bd.period_start_date + '1 day'::interval) AS t,
+        -- Total calendar days in the period (inclusive)
+        (
+            bd.period_end_date::date
+            - bd.period_start_date::date
+            + 1
+        )::double precision AS t,
 
-        date_part('day'::text,
+        -- Calendar days elapsed before the event
+        (
             COALESCE(
-                CASE WHEN bd.raw_trans_code::text = 'CDIV'::text THEN bd.payment_date END,
+                CASE
+                    WHEN bd.raw_trans_code = 'CDIV'
+                    THEN bd.payment_date
+                END,
                 bd.record_date,
-                bd.activity_date
-            )::timestamptz - bd.period_start_date
-        ) AS ti,
+                bd.activity_date::date
+            ) - bd.period_start_date::date
+        )::double precision AS ti,
 
-        date_part('day'::text,
-            bd.period_end_date
-            - COALESCE(
-                CASE WHEN bd.raw_trans_code::text = 'CDIV'::text THEN bd.payment_date END,
-                bd.record_date,
-                bd.activity_date
-            )::timestamptz
-            + '1 day'::interval
-        )
-        / date_part('day'::text, bd.period_end_date - bd.period_start_date + '1 day'::interval) AS weight
+        -- Modified Dietz weight (inclusive-day convention)
+        (
+            (
+                bd.period_end_date::date
+                - COALESCE(
+                    CASE
+                        WHEN bd.raw_trans_code = 'CDIV'
+                        THEN bd.payment_date
+                    END,
+                    bd.record_date,
+                    bd.activity_date::date
+                )
+                + 1
+            )::double precision
+            /
+            NULLIF(
+                bd.period_end_date::date
+                - bd.period_start_date::date
+                + 1,
+                0
+            )
+        ) AS weight
 
     FROM base_data bd
 )
