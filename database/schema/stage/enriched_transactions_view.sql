@@ -116,7 +116,7 @@ WITH base_data AS (
             ELSE t.amount
         END AS cash_flow
 
-    FROM transactions t
+    FROM source.transactions t
 ),
 calculated_dimensions AS (
     SELECT
