@@ -38,7 +38,7 @@ def get_portfolio_monthly_returns() -> pd.DataFrame:
             period_status,
             valuation_status
 
-        FROM mart.portfolio_modified_dietz_v
+        FROM mart.portfolio_modified_dietz_mv
 
         ORDER BY period_start;
     """

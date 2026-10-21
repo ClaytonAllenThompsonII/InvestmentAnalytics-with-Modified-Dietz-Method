@@ -386,3 +386,6 @@ if __name__ == "__main__":
     print("Transaction ingestion complete.")
 
     # Make sure to delete automated Robinhood informational text at the bottom of a newly generated report. 
+
+    # whenever we refresh Robinhood transactions, Alpha Vantage market data, or advance to a new reporting period, we'll need to execute:
+    # REFRESH MATERIALIZED VIEW mart.portfolio_modified_dietz_mv;
