@@ -12,6 +12,7 @@ import os
 from datetime import datetime
 import psycopg
 import pandas as pd
+from collections import Counter
 from dotenv import load_dotenv
 
 
@@ -88,7 +89,7 @@ def parse_date(value):
 def standardize_trans_code(code):
     """
     Map Robinhood transaction codes to descriptive labels.
-    Example: 'ACH' => 'Automated Clearing House', 'OCA' => 'One-Cancel-All Order', etc.
+    Example: 'ACH' => 'Automated Clearing House', 'OCA' => 'Option Contract Adjustment', etc.
     """
     code_map = {
         'ACH': 'Automated Clearing House',
@@ -100,7 +101,7 @@ def standardize_trans_code(code):
         'DFEE': 'Fee',
         'DTAX': 'Tax',
         'GOLD': 'Gold Fee',
-        'OCA': 'One-Cancel-All Order',
+        'OCA': 'Option Contract Adjustment',
         'OEXP': 'Option Expiration',
         'REC': 'Received Something',
         'Sell': 'Sell',
@@ -173,6 +174,53 @@ def check_transaction_codes(conn, df):
 
     if not new_codes and not missing_codes:
         print("Transaction-code check passed: no code changes detected.")
+
+
+def validate_historical_coverage(conn, df):
+    """
+    Ensure an incoming full-history Robinhood export does not
+    omit previously loaded transaction date/code groups.
+
+    Raises ValueError before TRUNCATE if validation fails.
+    """
+    if df.empty:
+        raise ValueError("Incoming Robinhood CSV is empty.")
+
+    if df["activity_date"].isna().any():
+        raise ValueError("Incoming CSV contains invalid activity dates.")
+
+    if df["raw_trans_code"].isna().any():
+        raise ValueError("Incoming CSV contains missing transaction codes.")
+
+    incoming = Counter(
+        zip(df["activity_date"], df["raw_trans_code"])
+    )
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT activity_date, raw_trans_code, COUNT(*)
+            FROM source.transactions
+            GROUP BY activity_date, raw_trans_code;
+        """)
+        existing = Counter({
+            (d, c): n for d, c, n in cur.fetchall()
+        })
+
+    missing = existing - incoming
+
+    if missing:
+        raise ValueError(
+            "Historical transaction coverage check failed. "
+            f"Missing {sum(missing.values())} transactions "
+            f"across {len(missing)} date/code groups. "
+            f"Examples: {list(missing.items())[:5]}"
+        )
+
+    print(
+        "Historical coverage check passed: "
+        "no missing transaction date/code groups."
+    )
+
 
 def ingest_transactions(csv_file_path):
     """
@@ -267,6 +315,8 @@ def ingest_transactions(csv_file_path):
     # source.transactions in a single database transaction.
     with get_connection() as conn:
         check_transaction_codes(conn, df)
+        validate_historical_coverage(conn, df)
+
 
         with conn.cursor() as cursor:
             cursor.execute(truncate_sql)
@@ -336,3 +386,6 @@ if __name__ == "__main__":
     print("Transaction ingestion complete.")
 
     # Make sure to delete automated Robinhood informational text at the bottom of a newly generated report. 
+
+    # whenever we refresh Robinhood transactions, Alpha Vantage market data, or advance to a new reporting period, we'll need to execute:
+    # REFRESH MATERIALIZED VIEW mart.portfolio_modified_dietz_mv;
