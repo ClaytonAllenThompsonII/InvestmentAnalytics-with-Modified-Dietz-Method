@@ -44,3 +44,34 @@ def get_portfolio_monthly_returns() -> pd.DataFrame:
     """
 
     return query_dataframe(query)
+
+
+
+def get_portfolio_daily_returns() -> pd.DataFrame:
+    """
+    Retrieve daily-valued portfolio TWR observations.
+
+    Returns one observation per valuation date, including
+    the inception date with a NULL daily return.
+
+    Returns remain in decimal form:
+        0.05 represents +5%, not 0.05%.
+    """
+
+    query = """
+        SELECT
+            nav_date,
+            previous_nav_date,
+            beginning_nav,
+            ending_nav,
+            external_flow,
+            daily_return,
+            valuation_status
+
+        FROM mart.portfolio_daily_twr_mv
+
+        ORDER BY nav_date;
+    """
+
+    return query_dataframe(query)
+
