@@ -1,11 +1,9 @@
 
 """
-Unified portfolio performance reporting.
+Unified portfolio and benchmark performance reporting.
 
-Combines daily TWR and linked Modified Dietz into a
-consistent dataset for downstream reporting applications.
-
-Returns remain in decimal form.
+Daily TWR and Modified Dietz determine reporting periods.
+Benchmark returns use adjusted closing prices.
 """
 
 from datetime import date
@@ -14,6 +12,10 @@ from decimal import Decimal
 import pandas as pd
 
 from .annualization import annualize_return
+from .benchmarks import (
+    calculate_benchmark_total_return,
+    resolve_benchmark_valuation_dates,
+)
 from .daily_twr import (
     calculate_daily_calendar_return_details,
     calculate_daily_trailing_return_details,
@@ -36,25 +38,24 @@ TRAILING_MONTHS = {
     "T60M": 60,
 }
 
+BENCHMARKS = (
+    "SPY", "QQQ", "XLK", "XLY", "EEM", "IXUS",
+)
+
 
 def build_portfolio_performance_report(
     monthly_returns: pd.DataFrame,
     daily_returns: pd.DataFrame,
     inception_date: date,
+    benchmark_prices: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    Build a unified portfolio performance dataset.
+    Build a unified portfolio and benchmark performance dataset.
 
-    Combines:
-        - Daily-valued TWR
-        - Geometrically linked monthly Modified Dietz
+    Returns one observation per asset, methodology, and horizon.
 
-    Annualizes trailing returns only.
-
-    Modified Dietz trailing periods use completed months.
-    Daily TWR trailing periods use valuation-date anchors.
-
-    Returns one row per methodology and reporting horizon.
+    Benchmark prices are optional to preserve compatibility
+    with portfolio-only reporting.
     """
 
     twr = {
@@ -84,28 +85,21 @@ def build_portfolio_performance_report(
 
     for methodology, details in methods.items():
         for horizon in HORIZONS:
-
             result = details[horizon]
             cumulative = result["return"]
             annualized = None
 
-            if (
-                horizon in TRAILING_MONTHS
-                and cumulative is not None
-            ):
+            # Portfolio annualization
+            if horizon in TRAILING_MONTHS and cumulative is not None:
                 if methodology == "modified_dietz":
                     years = (
                         Decimal(TRAILING_MONTHS[horizon])
                         / Decimal(12)
                     )
                 else:
-                    valuation_start = result[
-                        "valuation_start_date"
-                    ]
-
                     elapsed_days = (
                         result["as_of_date"]
-                        - valuation_start
+                        - result["valuation_start_date"]
                     ).days
 
                     years = (
@@ -113,9 +107,7 @@ def build_portfolio_performance_report(
                         / Decimal("365.25")
                     )
 
-                annualized = annualize_return(
-                    cumulative, years
-                )
+                annualized = annualize_return(cumulative, years)
 
             records.append({
                 "asset": "Portfolio",
@@ -131,5 +123,79 @@ def build_portfolio_performance_report(
                 "period_status": result["period_status"],
                 "valuation_status": result["valuation_status"],
             })
+
+            if benchmark_prices is None:
+                continue
+
+            # Benchmark total returns over matching periods
+            for instrument in BENCHMARKS:
+                benchmark_return = None
+                benchmark_annualized = None
+                anchor = None
+                benchmark_status = "unavailable"
+
+                if cumulative is not None:
+                    include_start = (
+                        methodology == "modified_dietz"
+                        or horizon in ("MTD", "QTD", "YTD")
+                    )
+
+                    anchor, ending = resolve_benchmark_valuation_dates(
+                        benchmark_prices,
+                        instrument,
+                        result["start_date"],
+                        result["as_of_date"],
+                        include_start_date_return=include_start,
+                    )
+
+                    # Require identical beginning valuations for
+                    # the portfolio and benchmark trailing TWR.
+                    if (
+                        methodology == "daily_twr"
+                        and horizon in TRAILING_MONTHS
+                        and anchor != result["valuation_start_date"]
+                    ):
+                        raise ValueError(
+                            f"{instrument} {horizon}: Benchmark "
+                            "anchor differs from portfolio anchor."
+                        )
+
+                    benchmark_return = calculate_benchmark_total_return(
+                        benchmark_prices,
+                        instrument,
+                        anchor,
+                        ending,
+                    )
+
+                    if horizon in TRAILING_MONTHS:
+                        if methodology == "modified_dietz":
+                            years = (
+                                Decimal(TRAILING_MONTHS[horizon])
+                                / Decimal(12)
+                            )
+                        else:
+                            years = (
+                                Decimal((ending - anchor).days)
+                                / Decimal("365.25")
+                            )
+
+                        benchmark_annualized = annualize_return(
+                            benchmark_return, years
+                        )
+
+                    benchmark_status = "complete"
+
+                records.append({
+                    "asset": instrument,
+                    "methodology": methodology,
+                    "horizon": horizon,
+                    "cumulative_return": benchmark_return,
+                    "annualized_return": benchmark_annualized,
+                    "start_date": result["start_date"],
+                    "valuation_start_date": anchor,
+                    "as_of_date": result["as_of_date"],
+                    "period_status": result["period_status"],
+                    "valuation_status": benchmark_status,
+                })
 
     return pd.DataFrame(records)

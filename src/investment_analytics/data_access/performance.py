@@ -75,3 +75,34 @@ def get_portfolio_daily_returns() -> pd.DataFrame:
 
     return query_dataframe(query)
 
+
+BENCHMARK_SYMBOLS = (
+    "SPY",
+    "QQQ",
+    "XLK",
+    "XLY",
+    "EEM",
+    "IXUS",
+)
+
+
+def get_benchmark_daily_prices() -> pd.DataFrame:
+    """
+    Retrieve adjusted daily closing prices for
+    portfolio performance benchmarks.
+    """
+
+    sql = """
+        SELECT
+            instrument,
+            date AS price_date,
+            adj_close AS adjusted_close
+        FROM core.daily_prices_v
+        WHERE instrument = ANY(%s)
+        ORDER BY instrument, date
+    """
+
+    return query_dataframe(
+        sql,
+        (list(BENCHMARK_SYMBOLS),),
+    )

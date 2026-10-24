@@ -9,6 +9,7 @@ import streamlit as st
 from investment_analytics.data_access.performance import (
     get_portfolio_daily_returns,
     get_portfolio_monthly_returns,
+    get_benchmark_daily_prices,
 )
 from investment_analytics.performance.reporting import (
     build_portfolio_performance_report,
@@ -22,6 +23,13 @@ HORIZONS = [
     "T12M", "T24M", "T36M", "T60M",
 ]
 
+HORIZON_LABELS = {
+    "T12M": "TTM",
+    "T24M": "2Y",
+    "T36M": "3Y",
+    "T60M": "5Y",
+}
+
 TRAILING_HORIZONS = HORIZONS[3:]
 
 BENCHMARKS = ["SPY", "QQQ", "XLK", "XLY", "EEM", "IXUS"]
@@ -34,7 +42,9 @@ def load_report() -> pd.DataFrame:
         get_portfolio_monthly_returns(),
         get_portfolio_daily_returns(),
         INCEPTION_DATE,
+        get_benchmark_daily_prices(),
     )
+
 
 
 def build_matrix(
@@ -43,38 +53,69 @@ def build_matrix(
     metric: str,
     horizons: list[str],
 ) -> pd.DataFrame:
-    """Build the portfolio-first reporting matrix."""
+    """Build a portfolio-first performance matrix."""
 
-    selected = report.loc[
-        report["methodology"] == methodology
-    ].set_index("horizon")
+    selected = (
+        report.loc[report["methodology"] == methodology]
+        .set_index(["asset", "horizon"])
+    )
 
-    portfolio = {"Asset": "Portfolio"}
+    assets = ["Portfolio", *BENCHMARKS]
 
-    for horizon in horizons:
-        observation = selected.loc[horizon]
-        value = observation[metric]
+    rows = []
 
-        if pd.isna(value):
-            portfolio[horizon] = "—"
-        else:
-            suffix = (
-                " †"
-                if observation["valuation_status"] == "partial"
-                else ""
-            )
-            portfolio[horizon] = f"{value:+.2%}{suffix}"
+    for asset in assets:
+        row = {"Asset": asset}
 
-    rows = [portfolio]
+        for horizon in horizons:
+            observation = selected.loc[(asset, horizon)]
+            value = observation[metric]
 
-    # Placeholder rows until benchmark calculations are available.
-    for benchmark in BENCHMARKS:
-        rows.append({
-            "Asset": benchmark,
-            **{h: "—" for h in horizons},
-        })
+            if pd.isna(value):
+                row[horizon] = "—"
+            else:
+                suffix = (
+                    " †"
+                    if observation["valuation_status"] == "partial"
+                    else ""
+                )
 
-    return pd.DataFrame(rows).set_index("Asset")
+                row[horizon] = f"{value:+.2%}{suffix}"
+
+        rows.append(row)
+
+    return (
+        pd.DataFrame(rows)
+        .set_index("Asset")
+        .rename(columns=HORIZON_LABELS)
+    )
+
+def style_performance_matrix(matrix: pd.DataFrame):
+    """Style returns and highlight the portfolio row."""
+
+    def color_return(value):
+        if isinstance(value, str):
+            if value.startswith("+"):
+                return "color: #16a34a"
+            if value.startswith("-"):
+                return "color: #dc2626"
+        return ""
+
+    def highlight_portfolio(row):
+        if row.name == "Portfolio":
+            return [
+                "background-color: rgba(100, 116, 139, 0.15); "
+                "font-weight: bold"
+            ] * len(row)
+
+        return [""] * len(row)
+
+    return (
+        matrix.style
+        .map(color_return)
+        .apply(highlight_portfolio, axis=1)
+    )
+
 
 
 st.set_page_config(
@@ -108,11 +149,13 @@ st.caption(f"Latest available NAV: {latest_date}")
 st.subheader("Cumulative Returns")
 
 st.dataframe(
-    build_matrix(
-        report,
-        methodology,
-        "cumulative_return",
-        HORIZONS,
+    style_performance_matrix(
+        build_matrix(
+            report,
+            methodology,
+            "cumulative_return",
+            HORIZONS,
+        )
     ),
     width="stretch",
 )
@@ -120,18 +163,20 @@ st.dataframe(
 st.subheader("Annualized Returns")
 
 st.dataframe(
-    build_matrix(
-        report,
-        methodology,
-        "annualized_return",
-        TRAILING_HORIZONS,
+    style_performance_matrix(
+        build_matrix(
+            report,
+            methodology,
+            "annualized_return",
+            TRAILING_HORIZONS,
+        )
     ),
     width="stretch",
 )
 
 st.caption(
     "† Partial historical valuation coverage. "
-    "Benchmark returns have not yet been implemented."
+    "Benchmark returns reflect dividend-adjusted closing prices."
 )
 
 with st.expander("Performance methodology"):
