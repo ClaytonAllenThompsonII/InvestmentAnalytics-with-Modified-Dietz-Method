@@ -2,21 +2,29 @@
 --
 -- Purpose:
 -- Calculate daily portfolio NAV from equity holdings,
--- option holdings, and cash balances.
+-- option holdings, cash balances, and accrued dividends.
 --
--- NAV = Equity NMV + Option NMV + Cash
+-- NAV = Equity NMV + Option NMV + Cash + Dividend Receivables
 --
 -- Notes:
--- Portfolio NMV includes both equities and options.
 -- Partial equity valuations are flagged but retained.
 -- Missing option valuations or cash balances produce NULL NAV.
 
 CREATE OR REPLACE VIEW core.portfolio_nav_daily_v AS
 
+WITH receivables AS (
+    SELECT
+        date,
+        SUM(dividend_receivable)::numeric
+            AS dividend_receivable
+    FROM core.dividend_receivable_daily_v
+    GROUP BY date
+)
+
 SELECT
     e.date,
 
-    -- Total invested market value
+    -- Total invested market value (equities + options)
     (
         COALESCE(e.portfolio_nmv, 0)
         + o.option_nmv
@@ -24,11 +32,12 @@ SELECT
 
     c.cash_balance::numeric AS cash_balance,
 
-    -- Total portfolio NAV
+    -- Total portfolio NAV, including accrued dividends
     (
         COALESCE(e.portfolio_nmv, 0)
         + o.option_nmv
         + c.cash_balance
+        + COALESCE(d.dividend_receivable, 0)
     )::numeric AS portfolio_nav,
 
     -- Component detail
@@ -48,7 +57,11 @@ SELECT
             THEN 'partial'
 
         ELSE 'complete'
-    END AS valuation_status
+    END AS valuation_status,
+
+    -- New column must be appended last
+    COALESCE(d.dividend_receivable, 0)::numeric
+        AS dividend_receivable
 
 FROM core.portfolio_nmv_daily_v e
 
@@ -56,4 +69,7 @@ LEFT JOIN core.portfolio_option_nmv_daily_v o
     ON o.date = e.date
 
 LEFT JOIN core.cash_balance_daily_v c
-    ON c.date = e.date;
+    ON c.date = e.date
+
+LEFT JOIN receivables d
+    ON d.date = e.date;
