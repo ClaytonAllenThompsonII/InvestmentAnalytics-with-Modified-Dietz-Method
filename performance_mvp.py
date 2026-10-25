@@ -46,7 +46,6 @@ def load_report() -> pd.DataFrame:
     )
 
 
-
 def build_matrix(
     report: pd.DataFrame,
     methodology: str,
@@ -89,6 +88,7 @@ def build_matrix(
         .set_index("Asset")
         .rename(columns=HORIZON_LABELS)
     )
+
 
 def style_performance_matrix(matrix: pd.DataFrame):
     """Style returns and highlight the portfolio row."""
