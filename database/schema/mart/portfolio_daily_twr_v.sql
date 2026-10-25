@@ -16,11 +16,8 @@ WITH daily_nav AS (
     SELECT
         date AS nav_date,
 
-        (
-            equity_nmv
-            + option_nmv
-            + cash_balance
-        )::numeric AS ending_nav,
+        -- Use authoritative portfolio NAV
+        portfolio_nav AS ending_nav,
 
         valuation_status,
 
@@ -28,11 +25,9 @@ WITH daily_nav AS (
             ORDER BY date
         ) AS previous_nav_date,
 
-        LAG(
-            equity_nmv + option_nmv + cash_balance
-        ) OVER (
+        LAG(portfolio_nav) OVER (
             ORDER BY date
-        )::numeric AS beginning_nav,
+        ) AS beginning_nav,
 
         LAG(valuation_status) OVER (
             ORDER BY date
@@ -53,12 +48,11 @@ daily_flows AS (
 
     LEFT JOIN stage.txn_classified_v t
         ON t.raw_trans_code = 'ACH'
-        AND t.econ_date::date >
-            COALESCE(
-                n.previous_nav_date,
-                n.nav_date - 1
-            )
-        AND t.econ_date::date <= n.nav_date
+       AND t.econ_date > COALESCE(
+           n.previous_nav_date,
+           n.nav_date - 1
+       )
+       AND t.econ_date <= n.nav_date
 
     GROUP BY n.nav_date
 )
@@ -72,11 +66,11 @@ SELECT
 
     CASE
         -- No return before the first beginning valuation.
-        WHEN n.beginning_nav IS NULL THEN NULL
+        WHEN n.beginning_nav IS NULL THEN NULL::numeric
 
         -- Prevent invalid or zero-capital denominators.
         WHEN n.beginning_nav + f.external_flow <= 0
-            THEN NULL
+            THEN NULL::numeric
 
         ELSE (
             n.ending_nav
