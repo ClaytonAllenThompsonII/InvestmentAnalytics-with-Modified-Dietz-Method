@@ -25,6 +25,8 @@ from .modified_dietz import (
     calculate_trailing_monthly_return_details,
 )
 
+from .security_reporting import build_security_performance_report
+
 
 HORIZONS = (
     "MTD", "QTD", "YTD",
@@ -199,3 +201,81 @@ def build_portfolio_performance_report(
                 })
 
     return pd.DataFrame(records)
+
+
+
+def build_unified_performance_report(
+    portfolio_monthly_returns: pd.DataFrame,
+    portfolio_daily_returns: pd.DataFrame,
+    security_monthly_returns: pd.DataFrame,
+    security_daily_returns: pd.DataFrame,
+    current_holdings: pd.DataFrame,
+    inception_date: date,
+    as_of_date: date,
+    last_completed_month: date,
+    benchmark_prices: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Combine current securities, portfolio, and benchmarks
+    into one performance reporting dataset.
+
+    Return calculations remain in their existing modules.
+    """
+
+    # Existing portfolio and benchmark reporting.
+    portfolio_report = build_portfolio_performance_report(
+        monthly_returns=portfolio_monthly_returns,
+        daily_returns=portfolio_daily_returns,
+        inception_date=inception_date,
+        benchmark_prices=benchmark_prices,
+    )
+
+    # New validated security-level reporting.
+    security_report = build_security_performance_report(
+        daily_returns=security_daily_returns,
+        monthly_returns=security_monthly_returns,
+        current_holdings=current_holdings,
+        inception_date=inception_date,
+        as_of_date=as_of_date,
+        last_completed_month=last_completed_month,
+    )
+
+    # Identify portfolio and benchmark records.
+    portfolio_report = portfolio_report.copy()
+
+    portfolio_report["asset_group"] = (
+        portfolio_report["asset"].apply(
+            lambda asset: (
+                "portfolio"
+                if asset == "Portfolio"
+                else "benchmark"
+            )
+        )
+    )
+
+    # Portfolio and benchmarks have their own
+    # established return conventions.
+    # The security basis selector does not alter them.
+    portfolio_report["return_basis"] = "standard"
+
+    # Concatenate without modifying any return calculations.
+    unified_report = pd.concat(
+        [security_report, portfolio_report],
+        ignore_index=True,
+        sort=False,
+    )
+
+    # One unique record per reporting combination.
+    keys = [
+        "asset",
+        "methodology",
+        "return_basis",
+        "horizon",
+    ]
+
+    if unified_report.duplicated(keys).any():
+        raise ValueError(
+            "Duplicate unified performance reporting records."
+        )
+
+    return unified_report

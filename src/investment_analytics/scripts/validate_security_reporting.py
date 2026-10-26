@@ -8,6 +8,7 @@ DRAM | May 2026 | Purchase and complete liquidation
 Expected cumulative return:
 (324.15 / 295.65) - 1 = approximately 9.6398%
 """
+import math
 
 from datetime import date
 
@@ -16,6 +17,8 @@ import pandas as pd
 from investment_analytics.data_access.database import query_dataframe
 from investment_analytics.performance.security_reporting import (
     calculate_security_daily_return_details,
+    calculate_security_monthly_return_details,
+    build_security_performance_report,
 )
 
 
@@ -226,7 +229,6 @@ print("PASS — Daily security TWR reporting coverage.")
 # 6. All current holdings — Full reporting validation
 # --------------------------------------------------
 
-import math
 
 print("\nCURRENT HOLDINGS — FULL REPORTING VALIDATION")
 print("-" * 65)
@@ -550,3 +552,273 @@ assert md_results["T60M"]["valuation_status"] == "complete"
 assert md_results["T60M"]["as_of_date"] == date(2026, 9, 30)
 
 print("\nPASS — TOST monthly Modified Dietz reporting.")
+
+
+
+# --------------------------------------------------
+# 10. All current holdings — Modified Dietz validation
+# --------------------------------------------------
+
+print("\nCURRENT HOLDINGS — MODIFIED DIETZ VALIDATION")
+print("-" * 65)
+
+monthly_query = """
+WITH reporting_date AS (
+    SELECT MAX(date)::date AS as_of_date
+    FROM core.portfolio_nav_daily_v
+),
+
+current_holdings AS (
+    SELECT s.instrument
+    FROM core.security_value_daily_v s
+    JOIN reporting_date r
+      ON s.date = r.as_of_date
+    WHERE s.qty_raw > 0
+)
+
+SELECT
+    m.instrument,
+    m.period_start,
+    m.nav_date,
+    m.value_bom,
+    m.value_eom,
+    m.trade_cash,
+    m.dividend_cash,
+    m.adr_fee_cash,
+    m.withholding_tax_cash,
+
+    m.gross_avg_capital,
+    m.net_fee_avg_capital,
+    m.after_withholding_avg_capital,
+
+    m.gross_md_return,
+    m.net_fee_md_return,
+    m.after_withholding_md_return
+
+FROM mart.security_modified_dietz_accrual_v m
+JOIN current_holdings h
+  ON h.instrument = m.instrument
+
+ORDER BY m.instrument, m.period_start;
+"""
+
+all_monthly = query_dataframe(monthly_query, ())
+
+if all_monthly.empty:
+    raise ValueError("No monthly security observations returned.")
+
+md_bases = {
+    "gross": "gross_md_return",
+    "net_fee": "net_fee_md_return",
+    "after_withholding": "after_withholding_md_return",
+}
+
+md_horizons = (
+    "MTD", "QTD", "YTD",
+    "T12M", "T24M", "T36M", "T60M",
+)
+
+md_rows = []
+md_validation_count = 0
+
+for instrument in holdings["instrument"]:
+
+    security = all_monthly.loc[
+        all_monthly["instrument"] == instrument
+    ].copy()
+
+    if security.empty:
+        raise ValueError(
+            f"{instrument}: Missing monthly history."
+        )
+
+    basis_results = {}
+
+    for basis, return_column in md_bases.items():
+
+        results = calculate_security_monthly_return_details(
+            monthly_returns=security,
+            inception_date=date(2020, 7, 6),
+            as_of_date=as_of,
+            last_completed_month=date(2026, 9, 1),
+            return_column=return_column,
+        )
+
+        assert set(results) == set(md_horizons)
+
+        basis_results[basis] = results
+
+        for horizon, result in results.items():
+
+            value = result["return"]
+            status = result["valuation_status"]
+
+            if status == "complete":
+                assert value is not None
+                assert math.isfinite(float(value))
+            else:
+                assert value is None
+
+            expected_as_of = (
+                date(2026, 9, 30)
+                if horizon.startswith("T")
+                else as_of
+            )
+
+            assert result["as_of_date"] == expected_as_of, (
+                f"{instrument} {horizon}: "
+                "Incorrect reporting endpoint."
+            )
+
+            md_validation_count += 1
+
+    for horizon in md_horizons:
+
+        gross = basis_results["gross"][horizon]
+        net = basis_results["net_fee"][horizon]
+        after = basis_results["after_withholding"][horizon]
+
+        # History classification is independent
+        # of the chosen return convention.
+        assert (
+            gross["history_status"]
+            == net["history_status"]
+            == after["history_status"]
+        )
+
+        value = gross["return"]
+
+        if value is None:
+            display = (
+                "INC"
+                if gross["valuation_status"] == "incomplete"
+                else "—"
+            )
+        else:
+            display = f"{float(value):+.2%}"
+
+            if gross["is_partial_period"]:
+                display += "†"
+            elif gross["has_ownership_gap"]:
+                display += "*"
+
+        md_rows.append({
+            "instrument": instrument,
+            "horizon": horizon,
+            "gross_return": display,
+            "history_status": gross["history_status"],
+            "gross_status": gross["valuation_status"],
+            "net_fee_status": net["valuation_status"],
+            "after_withholding_status": after["valuation_status"],
+        })
+
+
+md_report = pd.DataFrame(md_rows)
+
+md_matrix = md_report.pivot(
+    index="instrument",
+    columns="horizon",
+    values="gross_return",
+).reindex(
+    index=holdings["instrument"],
+    columns=list(md_horizons),
+)
+
+print("\nGROSS MODIFIED DIETZ — CURRENT HOLDINGS")
+print(md_matrix.to_string())
+
+print("\nHISTORY COVERAGE")
+print(
+    md_report.groupby(
+        ["history_status", "gross_status"]
+    ).size().to_string()
+)
+
+status_differences = md_report.loc[
+    (md_report["gross_status"] != md_report["net_fee_status"])
+    | (
+        md_report["gross_status"]
+        != md_report["after_withholding_status"]
+    )
+]
+
+print("\nRETURN-BASIS COVERAGE DIFFERENCES")
+print(
+    "None"
+    if status_differences.empty
+    else status_differences.to_string(index=False)
+)
+
+print(
+    f"\nPASS — {md_validation_count} Modified Dietz "
+    "return calculations validated."
+)
+print("PASS — All seven horizons and three return bases.")
+print("PASS — Reporting endpoints and history classifications.")
+
+
+
+security_report = build_security_performance_report(
+    daily_returns=all_daily,
+    monthly_returns=all_monthly,
+    current_holdings=holdings,
+    inception_date=date(2020, 7, 6),
+    as_of_date=as_of,
+    last_completed_month=date(2026, 9, 1),
+)
+
+assert len(security_report) == 378
+
+assert not security_report.duplicated(
+    ["asset", "methodology", "return_basis", "horizon"]
+).any()
+
+print("\nUNIFIED SECURITY REPORT")
+print("-" * 45)
+print(f"Records: {len(security_report)}")
+
+print(
+    security_report.groupby(
+        ["methodology", "return_basis"]
+    ).size().to_string()
+)
+
+print("\nANNUALIZATION ELIGIBILITY")
+
+print(
+    security_report.groupby(
+        ["history_status", "annualized_return"],
+        dropna=False,
+    ).size().groupby(level=0).sum().to_string()
+)
+
+print("\nPASS — Security report dataset constructed.")
+
+# Validate annualization eligibility.
+
+trailing = security_report["horizon"].isin(
+    ["T12M", "T24M", "T36M", "T60M"]
+)
+
+eligible = (
+    trailing
+    & security_report["history_status"].eq("full")
+    & security_report["valuation_status"].eq("complete")
+    & security_report["cumulative_return"].notna()
+)
+
+assert security_report.loc[
+    eligible, "annualized_return"
+].notna().all()
+
+assert security_report.loc[
+    ~eligible, "annualized_return"
+].isna().all()
+
+print("\nANNUALIZATION VALIDATION")
+print(f"Eligible records: {eligible.sum()}")
+print(
+    "Populated annualized returns:",
+    security_report["annualized_return"].notna().sum()
+)
+print("PASS — Annualization eligibility validated.")
