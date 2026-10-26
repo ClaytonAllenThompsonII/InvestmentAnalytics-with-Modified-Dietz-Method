@@ -8,14 +8,19 @@ inactive periods, and valuation-quality exceptions.
 
 Daily returns are sourced from mart.security_daily_twr_v.
 """
+from decimal import Decimal
 
 from calendar import monthrange
 from datetime import date
+from dateutil.relativedelta import relativedelta
 
+[]
 import pandas as pd
 
 from .horizons import horizon_starts
 from .linking import geometric_link
+
+from .annualization import annualize_return
 
 
 HORIZONS = (
@@ -104,6 +109,7 @@ def calculate_security_daily_return_details(
         raise ValueError(
             f"Unsupported return column: {return_column}"
         )
+
 
     if daily_returns.empty:
         raise ValueError("No security daily observations.")
@@ -373,14 +379,15 @@ def calculate_security_daily_return_details(
 
 
 
-from dateutil.relativedelta import relativedelta
 
 
-MONTHLY_RETURN_COLUMNS = {
-    "gross_md_return",
-    "net_fee_md_return",
-    "after_withholding_md_return",
+MONTHLY_CAPITAL_COLUMNS = {
+    "gross_md_return": "gross_avg_capital",
+    "net_fee_md_return": "net_fee_avg_capital",
+    "after_withholding_md_return": "after_withholding_avg_capital",
 }
+
+MONTHLY_RETURN_COLUMNS = set(MONTHLY_CAPITAL_COLUMNS)
 
 MONTHLY_FLOW_COLUMNS = (
     "trade_cash",
@@ -413,16 +420,19 @@ def calculate_security_monthly_return_details(
         raise ValueError(
             f"Unsupported return column: {return_column}"
         )
+    
+    capital_column = MONTHLY_CAPITAL_COLUMNS[return_column]
 
     if monthly_returns.empty:
         raise ValueError("No monthly security observations.")
+    
 
     required = {
         "period_start",
         "nav_date",
         "value_bom",
         "value_eom",
-        "gross_avg_capital",
+        capital_column,
         return_column,
         *MONTHLY_FLOW_COLUMNS,
     }
@@ -526,11 +536,13 @@ def calculate_security_monthly_return_details(
             ~selected["_inactive"]
         ]
 
+        capital = active[capital_column]
+
         bad_active = active.loc[
             active["value_bom"].isna()
             | active["value_eom"].isna()
-            | active["gross_avg_capital"].isna()
-            | active["gross_avg_capital"].le(0)
+            | capital.isna()
+            | capital.le(0)
             | active[return_column].isna()
             | active[return_column].lt(-1)
         ]
@@ -653,3 +665,175 @@ def calculate_security_monthly_return_details(
         }
 
     return results
+
+
+SECURITY_RETURN_BASES = {
+    "gross": (
+        "gross_daily_return",
+        "gross_md_return",
+    ),
+    "net_fee": (
+        "net_fee_daily_return",
+        "net_fee_md_return",
+    ),
+    "after_withholding": (
+        "after_withholding_daily_return",
+        "after_withholding_md_return",
+    ),
+}
+
+
+def build_security_performance_report(
+    daily_returns: pd.DataFrame,
+    monthly_returns: pd.DataFrame,
+    current_holdings: pd.DataFrame,
+    inception_date: date,
+    as_of_date: date,
+    last_completed_month: date,
+) -> pd.DataFrame:
+    """
+    Build security performance records for current holdings.
+
+    Produces one row per:
+        security x methodology x return basis x horizon.
+
+    Partial and intermittent histories retain cumulative
+    returns but are not annualized.
+
+    Portfolio and benchmark performance are handled separately.
+    """
+
+    if current_holdings.empty:
+        raise ValueError("No current holdings available.")
+
+    if current_holdings["instrument"].duplicated().any():
+        raise ValueError("Duplicate current holdings.")
+
+    holdings = current_holdings.sort_values(
+        "current_value",
+        ascending=False,
+    )
+
+    records = []
+
+    for position in holdings.itertuples(index=False):
+
+        instrument = position.instrument
+
+        security_daily = daily_returns.loc[
+            daily_returns["instrument"] == instrument
+        ].copy()
+
+        security_monthly = monthly_returns.loc[
+            monthly_returns["instrument"] == instrument
+        ].copy()
+
+        if security_daily.empty or security_monthly.empty:
+            raise ValueError(
+                f"{instrument}: Missing performance history."
+            )
+
+        for basis, (daily_col, monthly_col) in (
+            SECURITY_RETURN_BASES.items()
+        ):
+
+            daily_details = (
+                calculate_security_daily_return_details(
+                    daily_returns=security_daily,
+                    inception_date=inception_date,
+                    as_of_date=as_of_date,
+                    return_column=daily_col,
+                )
+            )
+
+            monthly_details = (
+                calculate_security_monthly_return_details(
+                    monthly_returns=security_monthly,
+                    inception_date=inception_date,
+                    as_of_date=as_of_date,
+                    last_completed_month=last_completed_month,
+                    return_column=monthly_col,
+                )
+            )
+
+            methods = {
+                "daily_twr": daily_details,
+                "modified_dietz": monthly_details,
+            }
+
+            for methodology, details in methods.items():
+
+                for horizon in HORIZONS:
+
+                    result = details[horizon]
+                    cumulative = result["return"]
+                    annualized = None
+
+                    full_coverage = (
+                        result["valuation_status"] == "complete"
+                        and result["history_status"] == "full"
+                    )
+
+                    if (
+                        horizon in TRAILING_HORIZONS
+                        and cumulative is not None
+                        and full_coverage
+                    ):
+
+                        if methodology == "daily_twr":
+                            anchor = result["valuation_start_date"]
+
+                            if anchor is not None:
+                                elapsed_days = (
+                                    result["as_of_date"] - anchor
+                                ).days
+
+                                years = (
+                                    Decimal(elapsed_days)
+                                    / Decimal("365.25")
+                                )
+                            else:
+                                years = Decimal(0)
+
+                        else:
+                            months = int(horizon[1:-1])
+                            years = (
+                                Decimal(months) / Decimal(12)
+                            )
+
+                        if years > 0:
+                            annualized = annualize_return(
+                                cumulative,
+                                years,
+                            )
+
+                    effective_start = (
+                        result.get("effective_start_date")
+                        if methodology == "daily_twr"
+                        else result.get("effective_start_month")
+                    )
+
+                    records.append({
+                        "asset": instrument,
+                        "asset_group": "security",
+                        "current_value": position.current_value,
+                        "methodology": methodology,
+                        "return_basis": basis,
+                        "horizon": horizon,
+                        "cumulative_return": cumulative,
+                        "annualized_return": annualized,
+                        "start_date": result["start_date"],
+                        "effective_start_date": effective_start,
+                        "valuation_start_date": result.get(
+                            "valuation_start_date"
+                        ),
+                        "as_of_date": result["as_of_date"],
+                        "period_status": result["period_status"],
+                        "valuation_status": result["valuation_status"],
+                        "history_status": result["history_status"],
+                        "is_partial_period": result["is_partial_period"],
+                        "has_ownership_gap": result["has_ownership_gap"],
+                    })
+
+    return pd.DataFrame(records)
+
