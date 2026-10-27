@@ -20,6 +20,10 @@ import pandas as pd
 import psycopg
 from dotenv import load_dotenv
 
+from investment_analytics.ingestion.refresh_reporting_mvs import (
+    refresh_reporting_mvs,
+)
+
 # ------------------------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------------------------
@@ -435,6 +439,8 @@ def main(mode: str = "refresh"):
             "mode must be either 'refresh' or 'rebuild'"
         )
 
+    failed_symbols: list[str] = []
+
     for i, symbol in enumerate(symbols, start=1):
         try:
             state = get_symbol_state(symbol)
@@ -456,14 +462,16 @@ def main(mode: str = "refresh"):
             df = fetch_daily_adjusted_with_retry(symbol, outputsize=outputsize)
 
             if df is None or df.empty:
-                logging.info("%s: no data returned; skipping", symbol)
+                logging.error("%s: no data returned; skipping", symbol)
+                failed_symbols.append(symbol)
                 time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
                 continue
 
             df = filter_df_for_load(symbol, df)
 
             if df.empty:
-                logging.info("%s: no market data remaining after retention filters; skipping", symbol)
+                logging.error("%s: no market data remaining after retention filters; skipping", symbol)
+                failed_symbols.append(symbol)
                 time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
                 continue
 
@@ -471,6 +479,7 @@ def main(mode: str = "refresh"):
 
             if not records:
                 logging.info("%s: no valid records after parsing; skipping", symbol)
+                failed_symbols.append(symbol)
                 time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
                 continue
 
@@ -488,10 +497,21 @@ def main(mode: str = "refresh"):
 
         except Exception as e:
             logging.error("Error processing %s: %s", symbol, e)
+            failed_symbols.append(symbol)
             # small sleep to be kind to AV even on errors
             time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
 
-    logging.info("Done.")
+    if failed_symbols:
+        raise RuntimeError(
+            "Market-data ingestion incomplete. "
+            "Reporting materialized views were not refreshed. "
+            f"Failed symbols: {failed_symbols}"
+        )
+
+    refresh_reporting_mvs()
+
+    logging.info("Market-data ingestion and reporting refresh complete.")
+
 
 # ------------------------------------------------------------------------------
 # USAGE

@@ -10,10 +10,16 @@ environment variable so personal brokerage data remains outside the repo.
 """
 import os
 from datetime import datetime
+from collections import Counter
+import logging
+
 import psycopg
 import pandas as pd
-from collections import Counter
 from dotenv import load_dotenv
+
+from investment_analytics.ingestion.refresh_reporting_mvs import (
+    refresh_reporting_mvs,
+)
 
 
 load_dotenv()  # Loads DB credentials from .env
@@ -369,7 +375,11 @@ def run_post_ingestion_pipeline():
 
 
 if __name__ == "__main__":
-    # Robinhood CSV file for all transactions from direct investing account
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+    )
+    # CSV file for all transactions from direct investing account
     csv_path = os.getenv("ROBINHOOD_TRANSACTIONS_PATH")
 
     if not csv_path:
@@ -380,12 +390,12 @@ if __name__ == "__main__":
     # Step 1: Load CSV to raw transactions
     ingest_transactions(csv_path)
     
-    # Step 2: Run modeling logic via stored procedures
+    # Step 2: Run modeling logic via stored procedures 
     #run_post_ingestion_pipeline()
     
+    # Step 3: Refresh performance reporting snapshots
+    refresh_reporting_mvs()
+
     print("Transaction ingestion complete.")
 
-    # Make sure to delete automated Robinhood informational text at the bottom of a newly generated report. 
-
-    # whenever we refresh Robinhood transactions, Alpha Vantage market data, or advance to a new reporting period, we'll need to execute:
-    # REFRESH MATERIALIZED VIEW mart.portfolio_modified_dietz_mv;
+    # Make sure to delete automated informational text at the bottom of a newly generated report.

@@ -138,7 +138,7 @@ def get_security_daily_returns() -> pd.DataFrame:
             d.after_withholding_daily_return,
             d.valuation_status
 
-        FROM mart.security_daily_twr_v d
+        FROM mart.security_daily_twr_mv d
         JOIN current_holdings h
           ON d.instrument = h.instrument
 
@@ -178,7 +178,7 @@ def get_security_monthly_returns() -> pd.DataFrame:
             m.net_fee_md_return,
             m.after_withholding_md_return
 
-        FROM mart.security_modified_dietz_accrual_v m
+        FROM mart.security_modified_dietz_accrual_mv m
         JOIN current_holdings h
           ON m.instrument = h.instrument
 
