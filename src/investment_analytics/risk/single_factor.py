@@ -2,33 +2,17 @@
 """Single-factor security risk analysis using daily adjusted market returns."""
 
 import argparse
-import os
 from datetime import date, timedelta
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import psycopg
 import statsmodels.api as sm
-from dotenv import load_dotenv
 from matplotlib.ticker import PercentFormatter
-
-
-load_dotenv()
+from investment_analytics.data_access.database import get_connection
 
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_BENCHMARK = "SPY"
-
-
-def get_connection():
-    """Connect to the Investment Analytics PostgreSQL database."""
-    return psycopg.connect(
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT", "5432"),
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-    )
 
 
 def get_open_positions() -> list[str]:
@@ -173,7 +157,7 @@ def analyze_single_factor(
         "correlation": float(y.corr(returns[benchmark])),
         "volatility": float(y.std(ddof=1) * annualization),
         "idiosyncratic_volatility": float(
-            np.sqrt(model.mse_resid) * annualization
+            model.resid.std(ddof=1) * annualization
         ),
         "tracking_error": float(
             (y - returns[benchmark]).std(ddof=1) * annualization
