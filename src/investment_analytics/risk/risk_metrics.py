@@ -737,6 +737,150 @@ def validate_common_sample_portfolio(
         "idio_cov_ann": idio_cov_ann,
     }
 
+
+
+# ---------------------------------------------------------------------
+# REUSABLE RISK REPORT
+# ---------------------------------------------------------------------
+
+def calculate_common_window_risk(
+    returns: pd.DataFrame,
+    risk_matrix: pd.DataFrame,
+    benchmark: str = DEFAULT_BENCHMARK,
+) -> dict:
+    """Calculate common-window risk for the current equity weights.
+
+    Fits one OLS market model to a synthetic daily-rebalanced,
+    constant-weight portfolio over dates shared by all holdings.
+    """
+
+    tickers = risk_matrix["ticker"].tolist()
+
+    common = (
+        returns[[benchmark, *tickers]]
+        .dropna(how="any")
+        .sort_index()
+    )
+
+    if len(common) < MIN_OBSERVATIONS:
+        raise ValueError(
+            "Insufficient common observations for portfolio risk: "
+            f"{len(common)}"
+        )
+
+    weights = (
+        risk_matrix.set_index("ticker")
+        .loc[tickers, "weight"]
+        .to_numpy(dtype=float)
+    )
+
+    portfolio_returns = common[tickers] @ weights
+    market_returns = common[benchmark]
+
+    model = sm.OLS(
+        portfolio_returns,
+        sm.add_constant(market_returns),
+    ).fit()
+
+    annualization = np.sqrt(TRADING_DAYS_PER_YEAR)
+
+    beta = float(model.params[benchmark])
+
+    market_vol_ann = float(
+        abs(beta)
+        * market_returns.std(ddof=1)
+        * annualization
+    )
+
+    idio_vol_ann = float(
+        model.resid.std(ddof=1) * annualization
+    )
+
+    total_vol_ann = float(
+        portfolio_returns.std(ddof=1) * annualization
+    )
+
+    np.testing.assert_allclose(
+        total_vol_ann,
+        np.hypot(market_vol_ann, idio_vol_ann),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+
+    return {
+        "portfolio_beta": beta,
+        "portfolio_market_vol_ann": market_vol_ann,
+        "portfolio_idio_vol_ann": idio_vol_ann,
+        "portfolio_total_vol_ann": total_vol_ann,
+        "observations": len(common),
+        "start_date": common.index.min().date(),
+        "end_date": common.index.max().date(),
+    }
+
+
+def load_risk_report(
+    benchmark: str = DEFAULT_BENCHMARK,
+    lookback: str = "2 Years",
+) -> dict:
+    """Build a complete security and portfolio risk report."""
+
+    lookback_offsets = {
+        "6 Months": pd.DateOffset(months=6),
+        "1 Year": pd.DateOffset(years=1),
+        "2 Years": pd.DateOffset(years=2),
+        "3 Years": pd.DateOffset(years=3),
+    }
+
+    if lookback not in lookback_offsets:
+        raise ValueError(f"Unsupported lookback: {lookback}")
+
+    benchmark = benchmark.upper()
+
+    end_date = get_latest_benchmark_date(benchmark)
+
+    start_date = (
+        pd.Timestamp(end_date)
+        - lookback_offsets[lookback]
+    ).date()
+
+    exposures = get_equity_exposures(end_date)
+
+    returns = get_daily_return_panel(
+        symbols=exposures["instrument"].tolist(),
+        start_date=start_date,
+        end_date=end_date,
+        benchmark=benchmark,
+    )
+
+    matrix, residual_panel = build_security_risk_matrix(
+        returns=returns,
+        exposures=exposures,
+        benchmark=benchmark,
+    )
+
+    summary = calculate_portfolio_risk(
+        risk_matrix=matrix,
+        residual_panel=residual_panel,
+        returns=returns,
+        benchmark=benchmark,
+    )
+
+    common_window = calculate_common_window_risk(
+        returns=returns,
+        risk_matrix=matrix,
+        benchmark=benchmark,
+    )
+
+    return {
+        "benchmark": benchmark,
+        "lookback": lookback,
+        "start_date": start_date,
+        "end_date": end_date,
+        "matrix": matrix,
+        "summary": summary,
+        "common_window": common_window,
+    }
+
 # ---------------------------------------------------------------------
 # EXECUTION
 # ---------------------------------------------------------------------
