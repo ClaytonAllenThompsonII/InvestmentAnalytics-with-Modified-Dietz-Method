@@ -393,3 +393,7 @@ with st.expander("Performance methodology"):
         "security has complete investment history for "
         "the respective horizon."
     )
+
+
+# Run from the repository root:
+# PYTHONPATH=src streamlit run Performance_MVP.py
