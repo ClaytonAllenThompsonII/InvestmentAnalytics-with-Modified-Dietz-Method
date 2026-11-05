@@ -3,6 +3,11 @@
 
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
+
+from investment_analytics.risk.active_risk import (
+    load_tracking_error_report,
+)
 
 from investment_analytics.risk.risk_metrics import (
     load_risk_report,
@@ -80,6 +85,11 @@ def get_cached_risk_report(
         benchmark=benchmark,
         lookback=lookback,
     )
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_cached_tracking_error(benchmark: str) -> pd.DataFrame:
+    """Cache rolling tracking error calculations."""
+    return load_tracking_error_report(benchmark)
 
 
 # ---------------------------------------------------------------------
@@ -497,6 +507,236 @@ def main() -> None:
     ):
         display_methodology(report)
 
+    
+    # -------------------------------------------------------------
+    # ROLLING TRACKING ERROR
+    # -------------------------------------------------------------
+
+    st.subheader("Tracking Error")
+
+    try:
+        tracking_error = get_cached_tracking_error(benchmark)
+
+    except Exception as exc:
+        st.warning(f"Tracking error unavailable: {exc}")
+
+    else:
+        latest_month = pd.Timestamp(tracking_error["month_end"].max())
+        
+        st.caption(
+            f"Rolling 24-Month Tracking Error as of "
+            f"{latest_month:%B %d, %Y}"
+        )
+
+        target_lower = 0.09
+        target_upper = 0.11
+
+        fig = go.Figure()
+
+        # Tracking-error target range
+        fig.add_hrect(
+            y0=target_lower,
+            y1=target_upper,
+            fillcolor="#CDCAC1",
+            opacity=0.35,
+            line_width=0,
+            annotation_text="Target: 9–11%",
+            annotation_position="top left",
+        )
+
+        # Rolling 24-month tracking error
+        fig.add_trace(
+            go.Scatter(
+                x=tracking_error["month_end"],
+                y=tracking_error["tracking_error_24m"],
+                mode="lines",
+                name=f"Tracking Error vs. {benchmark}",
+                line=dict(
+                    color="#4F79C0",
+                    width=2.5,
+                ),
+                hovertemplate=(
+                    "%{x|%b %Y}"
+                    "<br>Tracking Error: %{y:.2%}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+        fig.update_layout(
+            template="plotly_white",
+            height=380,
+            margin=dict(l=20, r=20, t=60, b=20),
+            showlegend=False,
+            hovermode="x",
+            xaxis=dict(
+                title=None,
+                tickformat="%Y",
+                showgrid=False,
+            ),
+            yaxis=dict(
+                title="Annualized Tracking Error",
+                tickformat=".0%",
+                rangemode="tozero",
+                gridcolor="#E2E8F0",
+            ),
+        )
+
+        # Default to the last three years of calculated history.
+        # This changes the display range, not the rolling window.
+        fig.update_xaxes(
+            range=[
+                latest_month - pd.DateOffset(years=3),
+                latest_month,
+            ],
+            dtick="M12",
+            tick0="2020-01-01",
+            tickformat="%Y",
+            rangeselector=dict(
+                buttons=[
+                    dict(
+                        count=3,
+                        label="3Y",
+                        step="year",
+                        stepmode="backward",
+                    ),
+                    dict(
+                        label="All",
+                        step="all",
+                    ),
+                ],
+                bgcolor="#F6F8FB",
+                activecolor="#E2E8F0",
+                bordercolor="#E2E8F0",
+                borderwidth=1,
+                x=0,
+                y=1.10,
+            ),
+        )
+
+
+        st.plotly_chart(
+            fig,
+            width="stretch",
+        )
+
+        st.caption(
+            f"Rolling 24-month sample standard deviation "
+            f"of monthly portfolio Modified Dietz returns "
+            f"minus {benchmark} monthly adjusted-price returns, "
+            f"annualized using √12. "
+            f"Shaded range: 9–11% target tracking error."
+        )
+
+
+        # -------------------------------------------------------------
+        # ROLLING INFORMATION RATIO
+        # -------------------------------------------------------------
+
+        st.subheader("Information Ratio")
+
+        st.caption(
+            f"Rolling 24-Month Information Ratio as of "
+            f"{latest_month:%B %d, %Y}"
+        )
+
+        fig_ir = go.Figure()
+
+        # Zero represents no average benchmark-relative return.
+        fig_ir.add_hline(
+            y=0,
+            line_color="#94A3B8",
+            line_width=1.5,
+            line_dash="dash",
+        )
+
+        fig_ir.add_trace(
+            go.Scatter(
+                x=tracking_error["month_end"],
+                y=tracking_error["information_ratio_24m"],
+                mode="lines",
+                name=f"Information Ratio vs. {benchmark}",
+                line=dict(
+                    color="#4F79C0",
+                    width=2.5,
+                ),
+                hovertemplate=(
+                    "%{x|%b %Y}"
+                    "<br>Information Ratio: %{y:+.3f}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+        fig_ir.update_layout(
+            template="plotly_white",
+            height=380,
+            margin=dict(l=20, r=20, t=60, b=20),
+            showlegend=False,
+            hovermode="x",
+            xaxis=dict(
+                title=None,
+                showgrid=False,
+            ),
+            yaxis=dict(
+                title="Information Ratio",
+                tickformat=".1f",
+                gridcolor="#E2E8F0",
+                zeroline=False,
+            ),
+        )
+
+        # Default to the last three years.
+        # Only the display changes, not the calculation.
+        fig_ir.update_xaxes(
+            range=[
+                latest_month - pd.DateOffset(years=3),
+                latest_month,
+            ],
+            dtick="M12",
+            tick0="2020-01-01",
+            tickformat="%Y",
+            rangeselector=dict(
+                buttons=[
+                    dict(
+                        count=3,
+                        label="3Y",
+                        step="year",
+                        stepmode="backward",
+                    ),
+                    dict(
+                        label="All",
+                        step="all",
+                    ),
+                ],
+                bgcolor="#F6F8FB",
+                activecolor="#E2E8F0",
+                bordercolor="#E2E8F0",
+                borderwidth=1,
+                x=0,
+                y=1.10,
+            ),
+        )
+
+        st.plotly_chart(
+            fig_ir,
+            width="stretch",
+        )
+
+        st.caption(
+            "Rolling 24-month Information Ratio equals the "
+            "annualized arithmetic mean of monthly active returns "
+            "(×12), divided by annualized Tracking Error (×√12). "
+            f"Active returns are portfolio Modified Dietz returns "
+            f"minus {benchmark} adjusted-price returns. "
+            "Geometric annualized returns (CAGR) are not used."
+        )
+
+
+
 
 if __name__ == "__main__":
     main()
+
+# Run from the repository root:
+# PYTHONPATH=src streamlit run Risk_MVP.py
