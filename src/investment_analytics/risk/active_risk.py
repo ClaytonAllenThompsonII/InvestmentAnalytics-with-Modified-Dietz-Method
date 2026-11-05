@@ -169,6 +169,40 @@ def calculate_rolling_tracking_error(
         monthly.index.to_timestamp(how="end").normalize()
     )
 
+    # -------------------------------------------------------------
+    # ROLLING INFORMATION RATIO
+    # -------------------------------------------------------------
+
+    # Annualized arithmetic mean of monthly active returns.
+    # This is not the difference between portfolio and
+    # benchmark geometric annualized returns (CAGR).
+    monthly["annualized_active_return_24m"] = (
+        monthly["active_return"]
+        .rolling(
+            window=window_months,
+            min_periods=window_months,
+        )
+        .mean()
+        * TRADING_MONTHS_PER_YEAR
+    )
+
+    # Information Ratio = annualized arithmetic active return
+    # divided by annualized tracking error.
+    # Undefined when tracking error is zero or unavailable.
+    valid_te = monthly["tracking_error_24m"].where(
+        monthly["tracking_error_24m"] > 0
+    )
+
+    
+    monthly["information_ratio_24m"] = (
+        monthly["annualized_active_return_24m"]
+        / valid_te
+    )
+
+    # -------------------------------------------------------------
+    # FINAL REPORT
+    # -------------------------------------------------------------
+
     result = monthly.loc[
         monthly["tracking_error_24m"].notna()
     ].copy()
@@ -185,9 +219,13 @@ def calculate_rolling_tracking_error(
             "portfolio_return",
             "benchmark_return",
             "active_return",
+            "annualized_active_return_24m",
             "tracking_error_24m",
+            "information_ratio_24m",
         ]
     ].reset_index(drop=True)
+
+
 
 
 def load_tracking_error_report(
